@@ -146,7 +146,14 @@ public class Program
         builder.Services.AddSingleton(azureOptions);
         builder.Services.AddSingleton(aiOptions);
         builder.Services.AddHttpClient<IAzureDevOpsClient, AzureDevOpsClient>();
-        builder.Services.AddHttpClient<ILLMProvider, OpenAiCompatibleProvider>();
+        if (aiOptions.Provider.Equals("gemini", StringComparison.OrdinalIgnoreCase))
+        {
+            builder.Services.AddHttpClient<ILLMProvider, GoogleGeminiProvider>();
+        }
+        else
+        {
+            builder.Services.AddHttpClient<ILLMProvider, OpenAiCompatibleProvider>();
+        }
         builder.Services.AddSingleton(new EvidenceNormalizer(30_000));
         builder.Services.AddTransient<TestSourceCollector>();
         builder.Services.AddTransient<IAIInvestigator, AIInvestigator>();

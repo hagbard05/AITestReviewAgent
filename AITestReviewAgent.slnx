@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="AITestReviewAgent/AITestReviewAgent.csproj" Id="32e2abec-40a9-493c-a992-fed1c4f79b33" />
+  <Project Path="AITestReviewAgent.Tests/AITestReviewAgent.Tests.csproj" />
 </Solution>

@@ -212,6 +212,21 @@ public sealed class InvestigationTests
         {
             parsedOptions.Validate(requireCredentials: false);
         });
+
+        var geminiConfig = new Microsoft.Extensions.Configuration.ConfigurationManager
+        {
+            ["AI:Provider"] = "gemini",
+            ["AI:Model"] = "gemini-2.5-flash",
+            ["AI:ApiKey"] = "provider-secret"
+        };
+        var geminiOptions = AiOptions.From(geminiConfig);
+        Assert.Equal("https://generativelanguage.googleapis.com/v1beta", geminiOptions.Endpoint);
+        geminiOptions.Validate(requireCredentials: true);
+        Assert.Throws<ConfigurationException>(() =>
+            (geminiOptions with { Endpoint = "https://example.com/gemini?key=secret" })
+            .Validate(requireCredentials: false));
+        Assert.Throws<ConfigurationException>(() =>
+            (geminiOptions with { Provider = "not-implemented" }).Validate(requireCredentials: false));
     }
 
     [Fact]
@@ -276,6 +291,83 @@ public sealed class InvestigationTests
             CancellationToken.None);
 
         Assert.Equal(2, handler.RequestCount);
+    }
+
+    [Fact]
+    public async Task GoogleGeminiProviderUsesNativeGenerateContentFormat()
+    {
+        var handler = new DelegateHandler((request, _) =>
+        {
+            Assert.Equal(HttpMethod.Post, request.Method);
+            Assert.Equal(
+                "/v1beta/models/gemini-2.5-flash:generateContent",
+                request.RequestUri!.AbsolutePath);
+            Assert.True(string.IsNullOrEmpty(request.RequestUri.Query));
+            Assert.Equal("provider-secret", request.Headers.GetValues("x-goog-api-key").Single());
+
+            using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+            var root = body.RootElement;
+            Assert.Equal("System rules", root.GetProperty("systemInstruction").GetProperty("parts")[0].GetProperty("text").GetString());
+            Assert.Equal("Untrusted test evidence", root.GetProperty("contents")[0].GetProperty("parts")[0].GetProperty("text").GetString());
+            Assert.Equal("application/json", root.GetProperty("generationConfig").GetProperty("responseMimeType").GetString());
+            Assert.Equal(400, root.GetProperty("generationConfig").GetProperty("maxOutputTokens").GetInt32());
+            Assert.Equal(0, root.GetProperty("generationConfig").GetProperty("temperature").GetDouble());
+
+            return Response(HttpStatusCode.OK,
+                """{"candidates":[{"content":{"parts":[{"text":"discard this thought","thought":true},{"text":"{\"classification\":\"Inconclusive\"}"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":32,"candidatesTokenCount":12},"modelVersion":"gemini-2.5-flash"}""");
+        });
+        var options = ValidGeminiOptions();
+        var provider = new GoogleGeminiProvider(new HttpClient(handler), options);
+
+        var result = await provider.CompleteAsync(
+            new LlmRequest("System rules", "Untrusted test evidence", options.Model, 400),
+            CancellationToken.None);
+
+        Assert.Equal("{\"classification\":\"Inconclusive\"}", result.Content);
+        Assert.DoesNotContain("discard this thought", result.Content);
+        Assert.Equal("gemini-2.5-flash", result.Model);
+        Assert.Equal(32, result.InputTokens);
+        Assert.Equal(12, result.OutputTokens);
+    }
+
+    [Fact]
+    public async Task GoogleGeminiProviderRetriesRateLimitsWithoutExposingKey()
+    {
+        var handler = new DelegateHandler((request, attempt) =>
+        {
+            Assert.Equal("provider-secret", request.Headers.GetValues("x-goog-api-key").Single());
+            Assert.DoesNotContain("provider-secret", request.RequestUri!.ToString());
+            return Response(
+                attempt == 1 ? HttpStatusCode.TooManyRequests : HttpStatusCode.OK,
+                attempt == 1
+                    ? """{"error":{"message":"private API key should not appear in errors"}}"""
+                    : """{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}]}""");
+        });
+        var options = ValidGeminiOptions();
+        var provider = new GoogleGeminiProvider(new HttpClient(handler), options);
+
+        var result = await provider.CompleteAsync(
+            new LlmRequest("system", "user", options.Model, options.MaxOutputTokens),
+            CancellationToken.None);
+
+        Assert.Equal(2, handler.RequestCount);
+        Assert.Equal("{}", result.Content);
+    }
+
+    [Fact]
+    public async Task GoogleGeminiProviderRejectsNonStopFinishReasons()
+    {
+        var handler = new DelegateHandler((_, _) => Response(
+            HttpStatusCode.OK,
+            """{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}"""));
+        var options = ValidGeminiOptions();
+        var provider = new GoogleGeminiProvider(new HttpClient(handler), options);
+
+        var exception = await Assert.ThrowsAsync<LlmProviderException>(() => provider.CompleteAsync(
+            new LlmRequest("system", "user", options.Model, options.MaxOutputTokens),
+            CancellationToken.None));
+
+        Assert.Contains("MAX_TOKENS", exception.Message);
     }
 
     [Fact]
@@ -456,6 +548,10 @@ public sealed class InvestigationTests
 
     private static AiOptions ValidAiOptions() =>
         new("openai-compatible", "gpt-4.1-mini", "https://api.openai.com/v1/chat/completions",
+            "provider-secret", 90, 5000, 50_000, 0);
+
+    private static AiOptions ValidGeminiOptions() =>
+        new("gemini", "gemini-2.5-flash", "https://generativelanguage.googleapis.com/v1beta",
             "provider-secret", 90, 5000, 50_000, 0);
 
     private static string BuildJson() => JsonSerializer.Serialize(new

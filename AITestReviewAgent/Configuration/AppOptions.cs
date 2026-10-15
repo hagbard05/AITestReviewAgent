@@ -70,21 +70,31 @@ public sealed record AiOptions(
     int MaxEvidenceCharacters,
     double Temperature)
 {
-    public static AiOptions From(IConfiguration configuration) => new(
-        configuration["AI:Provider"] ?? "openai-compatible",
-        configuration["AI:Model"] ?? string.Empty,
-        configuration["AI:Endpoint"] ?? string.Empty,
-        configuration["AI:ApiKey"] ?? string.Empty,
-        ReadInt(configuration, "AI:TimeoutSeconds", 90),
-        ReadInt(configuration, "AI:MaxOutputTokens", 5000),
-        ReadInt(configuration, "AI:MaxEvidenceCharacters", 50_000),
-        ReadDouble(configuration, "AI:Temperature", 0));
+    public static AiOptions From(IConfiguration configuration)
+    {
+        var provider = configuration["AI:Provider"] ?? "openai-compatible";
+        var defaultEndpoint = provider.Equals("gemini", StringComparison.OrdinalIgnoreCase)
+            ? "https://generativelanguage.googleapis.com/v1beta"
+            : "https://api.openai.com/v1/chat/completions";
+        return new AiOptions(
+            provider,
+            configuration["AI:Model"] ?? string.Empty,
+            configuration["AI:Endpoint"] ?? defaultEndpoint,
+            configuration["AI:ApiKey"] ?? string.Empty,
+            ReadInt(configuration["AI:TimeoutSeconds"], "AI:TimeoutSeconds", 90),
+            ReadInt(configuration["AI:MaxOutputTokens"], "AI:MaxOutputTokens", 5000),
+            ReadInt(configuration["AI:MaxEvidenceCharacters"], "AI:MaxEvidenceCharacters", 50_000),
+            ReadDouble(configuration, "AI:Temperature", 0));
+    }
 
     public void Validate(bool requireCredentials)
     {
-        if (!string.Equals(Provider, "openai-compatible", StringComparison.OrdinalIgnoreCase))
+        var isOpenAiCompatible = string.Equals(Provider, "openai-compatible", StringComparison.OrdinalIgnoreCase);
+        var isGemini = string.Equals(Provider, "gemini", StringComparison.OrdinalIgnoreCase);
+        if (!isOpenAiCompatible && !isGemini)
         {
-            throw new ConfigurationException("AI:Provider must be 'openai-compatible'; no other provider is implemented.");
+            throw new ConfigurationException(
+                "AI:Provider must be 'openai-compatible' or 'gemini'; no other provider is implemented.");
         }
 
         if (string.IsNullOrWhiteSpace(Model))
@@ -94,9 +104,13 @@ public sealed record AiOptions(
 
         if (!Uri.TryCreate(Endpoint, UriKind.Absolute, out var endpoint)
             || (endpoint.Scheme != Uri.UriSchemeHttps
-                && !(endpoint.Scheme == Uri.UriSchemeHttp && endpoint.IsLoopback)))
+                && !(endpoint.Scheme == Uri.UriSchemeHttp && endpoint.IsLoopback))
+            || !string.IsNullOrEmpty(endpoint.UserInfo)
+            || (isGemini && (!string.IsNullOrEmpty(endpoint.Query) || !string.IsNullOrEmpty(endpoint.Fragment))))
         {
-            throw new ConfigurationException("AI:Endpoint must be HTTPS (HTTP is allowed only for localhost tests).");
+            throw new ConfigurationException(isGemini
+                ? "AI:Endpoint must be a Gemini API base URL using HTTPS, without query or fragment (HTTP is allowed only for localhost tests)."
+                : "AI:Endpoint must be HTTPS (HTTP is allowed only for localhost tests).");
         }
 
         if (requireCredentials && string.IsNullOrWhiteSpace(ApiKey))
