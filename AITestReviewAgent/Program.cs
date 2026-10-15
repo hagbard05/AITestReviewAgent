@@ -78,10 +78,10 @@ public class Program
 
                     Console.WriteLine(
                         $"This sends sanitized failure evidence and test source to {aiOptions.Provider}/{aiOptions.Model}.");
-                    Console.Write("Type INVESTIGATE to authorize this model request: ");
-                    if (!string.Equals(Console.ReadLine(), "INVESTIGATE", StringComparison.Ordinal))
+                    Console.Write("Authorize this model reques?t: ");
+                    if (!string.Equals(Console.ReadKey().KeyChar.ToString(), "Y", StringComparison.Ordinal))
                     {
-                        Console.WriteLine("Investigation not submitted.");
+                        Console.WriteLine("Model request not authorised Investigation not submitted.");
                         return 0;
                     }
 
@@ -236,6 +236,13 @@ public class Program
         {
             Console.WriteLine(
                 $"Model: {result.Model}; token usage: input={result.InputTokens?.ToString() ?? "not reported"}, output={result.OutputTokens?.ToString() ?? "not reported"}");
+        }
+
+        if (result.ModelResponse is not null)
+        {
+            Console.WriteLine();
+            Console.WriteLine("Complete model response (secrets redacted):");
+            Console.WriteLine(result.ModelResponse);
         }
     }
 

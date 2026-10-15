@@ -8,6 +8,7 @@ using AITestReviewAgent.Domain;
 using AITestReviewAgent.Evidence;
 using AITestReviewAgent.Investigation;
 using AITestReviewAgent.Security;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace AITestReviewAgent.Tests;
@@ -188,6 +189,36 @@ public sealed class InvestigationTests
         Assert.False(result.ReproductionPlan.ExecutionPerformed);
         Assert.DoesNotContain("model claims it ran", result.ReproductionPlan.ActualObservations);
         Assert.Contains(result.Limitations, item => item.Contains("No controlled reproduction runner", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task InvestigatorLogsAndReturnsCompleteSecretRedactedModelResponse()
+    {
+        var context = CreateContext();
+        var fake = new FakeProvider(BuildModelResponse(
+            context,
+            summaryOverride: "The output includes api_key=super-secret-value and terminal control \u001b[31m."));
+        var logger = new RecordingLogger<AIInvestigator>();
+        var investigator = new AIInvestigator(fake, ValidAiOptions(), logger);
+
+        var result = await investigator.InvestigateAsync(
+            new InvestigationRequest(42, 7), context, CancellationToken.None);
+
+        Assert.NotNull(result.ModelResponse);
+        Assert.Contains("reproductionPlan", result.ModelResponse);
+        Assert.Contains("api_key=[REDACTED]", result.ModelResponse);
+        Assert.DoesNotContain("super-secret-value", result.ModelResponse);
+        Assert.DoesNotContain('\u001b', result.ModelResponse);
+        Assert.Contains(logger.Messages, message => message.Contains(result.ModelResponse, StringComparison.Ordinal));
+        Assert.DoesNotContain(logger.Messages, message => message.Contains("super-secret-value", StringComparison.Ordinal));
+
+        var controlCharacterOutput = EvidenceSanitizer.SanitizeModelOutput("terminal \u001b[31m");
+        Assert.DoesNotContain('\u001b', controlCharacterOutput);
+        Assert.Contains('\uFFFD', controlCharacterOutput);
+
+        var jsonSecretOutput = EvidenceSanitizer.SanitizeModelOutput("{\"api_key\":\"json-secret\"}");
+        Assert.Contains("\"api_key\":\"[REDACTED]\"", jsonSecretOutput);
+        Assert.DoesNotContain("json-secret", jsonSecretOutput);
     }
 
     [Fact]
@@ -572,8 +603,12 @@ public sealed class InvestigationTests
         Content = new StringContent(content, Encoding.UTF8, contentType)
     };
 
-    private sealed class FakeProvider(string content) : ILLMProvider
+    private sealed class FakeProvider : ILLMProvider
     {
+        private readonly string _content;
+
+        public FakeProvider(string content) => _content = content;
+
         public int CallCount { get; private set; }
         public LlmRequest? LastRequest { get; private set; }
 
@@ -581,7 +616,26 @@ public sealed class InvestigationTests
         {
             CallCount++;
             LastRequest = request;
-            return Task.FromResult(new ProviderResponse(content, request.Model, 100, 20));
+            return Task.FromResult(new ProviderResponse(_content, request.Model, 100, 20));
+        }
+    }
+
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        public List<string> Messages { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Messages.Add(formatter(state, exception));
         }
     }
 

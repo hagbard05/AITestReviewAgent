@@ -160,7 +160,8 @@ public sealed record InvestigationResult(
     ReproductionPlan ReproductionPlan,
     string? Model,
     long? InputTokens,
-    long? OutputTokens);
+    long? OutputTokens,
+    string? ModelResponse = null);
 
 public sealed record InvestigationContext(
     PipelineRun Build,

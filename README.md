@@ -69,6 +69,8 @@ If the build's full commit SHA cannot be verified, the repository is unavailable
 
 The model receives source files with one-based line numbers and stable evidence IDs. Its citations are checked against the collected package; unknown IDs or invalid source paths/line ranges fail the investigation. Unsupported claims are labeled. Logs, test output, source, and attachments are explicitly treated as untrusted data in the system prompt and serialized as data. Common credential formats are redacted, evidence is bounded, and binary attachments are referenced but not sent to the model. The investigator never executes commands or modifies Azure DevOps.
 
+After a provider responds, the complete model response text is logged and included in the investigation report and CLI output. Common credential patterns are redacted and terminal control characters are replaced before logging/display; the response remains untrusted model output. These logs and reports may contain diagnostic details, so keep them in an access-controlled location and do not enable less-restricted log forwarding.
+
 Confidence is a subjective model estimate, not a calibrated probability. The result includes token usage when the provider reports it; token cost is not estimated because pricing varies by model/account. The reproduction plan is never executed: the returned report always records that reproduction was not performed.
 
 ## MVP limits

@@ -4,10 +4,14 @@ using AITestReviewAgent.Configuration;
 using AITestReviewAgent.Domain;
 using AITestReviewAgent.Investigation;
 using AITestReviewAgent.Security;
+using Microsoft.Extensions.Logging;
 
 namespace AITestReviewAgent.AI;
 
-public sealed class AIInvestigator(ILLMProvider provider, AiOptions options) : IAIInvestigator
+public sealed class AIInvestigator(
+    ILLMProvider provider,
+    AiOptions options,
+    ILogger<AIInvestigator>? logger = null) : IAIInvestigator
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -68,6 +72,11 @@ public sealed class AIInvestigator(ILLMProvider provider, AiOptions options) : I
         var response = await provider.CompleteAsync(
             new LlmRequest(InvestigationPrompt.SystemPrompt, prompt, options.Model, options.MaxOutputTokens),
             cancellationToken);
+        var sanitizedResponse = EvidenceSanitizer.SanitizeModelOutput(response.Content);
+        logger?.LogInformation(
+            "Complete sanitized model response from {Model}:\n{ModelResponse}",
+            EvidenceSanitizer.SanitizeModelOutput(response.Model),
+            sanitizedResponse);
         if (UnsupportedOperationClaims.IsMatch(response.Content))
         {
             throw new InvestigationOutputException(
@@ -75,7 +84,7 @@ public sealed class AIInvestigator(ILLMProvider provider, AiOptions options) : I
         }
 
         var output = Parse(response.Content);
-        return ValidateAndBuild(request, context, output, response);
+        return ValidateAndBuild(request, context, output, response, sanitizedResponse);
     }
 
     public static InvestigationOutput Parse(string content)
@@ -106,7 +115,8 @@ public sealed class AIInvestigator(ILLMProvider provider, AiOptions options) : I
         InvestigationRequest request,
         InvestigationContext context,
         InvestigationOutput output,
-        ProviderResponse response)
+        ProviderResponse response,
+        string sanitizedResponse)
     {
         if (!Enum.TryParse<FailureClassification>(output.Classification, true, out var classification)
             || !Enum.IsDefined(classification))
@@ -331,7 +341,8 @@ public sealed class AIInvestigator(ILLMProvider provider, AiOptions options) : I
                 ExecutionPerformed: false),
             EvidenceSanitizer.Sanitize(response.Model),
             response.InputTokens,
-            response.OutputTokens);
+            response.OutputTokens,
+            sanitizedResponse);
     }
 
     private static IReadOnlyList<ReconstructedStep> ConvertSteps(
