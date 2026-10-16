@@ -53,7 +53,7 @@ dotnet run --project .\AITestReviewAgent\AITestReviewAgent.csproj -- tests --bui
 dotnet run --project .\AITestReviewAgent\AITestReviewAgent.csproj -- investigate --build-id 12345 --test-result-id 67890 --test-run-id 24680 --output .\reports\12345-67890.investigation.json
 ```
 
-The `runs` command lists recent failed builds; `tests` lists failed test result IDs and their test run IDs for a build; `investigate` handles one selected failed result. Pass `--test-run-id` from the `tests` output to scope result lookup to that run; it is optional. Before an AI request, the CLI requires the operator to type `INVESTIGATE`. Existing report paths are not overwritten. Ctrl+C cancels collection or analysis.
+The `runs` command lists recent failed builds; `tests` lists failed test result IDs and their test run IDs for a build; `investigate` handles one selected failed result. Pass `--test-run-id` from the `tests` output to scope result lookup to that run; it is optional. Before an AI request, the CLI requires the operator to type `INVESTIGATE`. Report parent directories are created automatically and existing report paths are not overwritten. Ctrl+C cancels collection or analysis.
 
 If the build's full commit SHA cannot be verified, the repository is unavailable, or the exact test method cannot be located unambiguously, the CLI returns a **preliminary / Inconclusive** report and does not call the model. The report contains source/provenance limitations and recommended next steps. Save reports only to an access-controlled location; they contain diagnostic text and Azure DevOps links, but not raw attachment bodies.
 

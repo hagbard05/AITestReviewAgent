@@ -7,6 +7,7 @@ using AITestReviewAgent.Configuration;
 using AITestReviewAgent.Domain;
 using AITestReviewAgent.Evidence;
 using AITestReviewAgent.Investigation;
+using AITestReviewAgent.Reports;
 using AITestReviewAgent.Security;
 using Microsoft.Extensions.Logging;
 using Xunit;
@@ -219,6 +220,31 @@ public sealed class InvestigationTests
         var jsonSecretOutput = EvidenceSanitizer.SanitizeModelOutput("{\"api_key\":\"json-secret\"}");
         Assert.Contains("\"api_key\":\"[REDACTED]\"", jsonSecretOutput);
         Assert.DoesNotContain("json-secret", jsonSecretOutput);
+    }
+
+    [Fact]
+    public async Task ReportWriterCreatesMissingParentDirectoriesAndDoesNotOverwrite()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), $"AITestReviewAgent-{Guid.NewGuid():N}");
+        var reportPath = Path.Combine(tempDirectory, "reports", "run", "investigation.json");
+
+        try
+        {
+            var writtenPath = await InvestigationReportWriter.WriteNewAsync(
+                reportPath, "{\"status\":\"Preliminary\"}", CancellationToken.None);
+
+            Assert.Equal(Path.GetFullPath(reportPath), writtenPath);
+            Assert.Equal("{\"status\":\"Preliminary\"}", await File.ReadAllTextAsync(reportPath));
+            await Assert.ThrowsAsync<IOException>(() => InvestigationReportWriter.WriteNewAsync(
+                reportPath, "replacement", CancellationToken.None));
+        }
+        finally
+        {
+            if (Directory.Exists(tempDirectory))
+            {
+                Directory.Delete(tempDirectory, recursive: true);
+            }
+        }
     }
 
     [Fact]

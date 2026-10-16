@@ -6,6 +6,7 @@ using AITestReviewAgent.Configuration;
 using AITestReviewAgent.Domain;
 using AITestReviewAgent.Evidence;
 using AITestReviewAgent.Investigation;
+using AITestReviewAgent.Reports;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -78,8 +79,8 @@ public class Program
 
                     Console.WriteLine(
                         $"This sends sanitized failure evidence and test source to {aiOptions.Provider}/{aiOptions.Model}.");
-                    Console.Write("Authorize this model reques?t: ");
-                    if (!string.Equals(Console.ReadKey().KeyChar.ToString(), "Y", StringComparison.Ordinal))
+                    Console.Write("Authorize this model request?: (y) ");
+                    if (!string.Equals(Console.ReadKey().KeyChar.ToString().ToLower(), "y", StringComparison.Ordinal))
                     {
                         Console.WriteLine("Model request not authorised Investigation not submitted.");
                         return 0;
@@ -95,8 +96,8 @@ public class Program
                     if (outputPath is not null)
                     {
                         var report = JsonSerializer.Serialize(result, ReportJsonOptions);
-                        var fullPath = Path.GetFullPath(outputPath);
-                        await File.WriteAllTextAsync(fullPath, report, cancellationSource.Token);
+                        var fullPath = await InvestigationReportWriter.WriteNewAsync(
+                            outputPath, report, cancellationSource.Token);
                         Console.WriteLine($"Report saved: {fullPath}");
                     }
 
