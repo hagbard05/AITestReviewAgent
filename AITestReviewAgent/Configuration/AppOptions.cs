@@ -156,4 +156,10 @@ public sealed record AiOptions(
     }
 }
 
+public sealed record GitHubOptions(string Token)
+{
+    public static GitHubOptions From(IConfiguration configuration) =>
+        new(configuration["GitHub:Token"] ?? string.Empty);
+}
+
 public sealed class ConfigurationException(string message) : Exception(message);

@@ -496,7 +496,7 @@ public sealed class InvestigationTests
         var normalizer = new EvidenceNormalizer(30_000);
         var sourceItem = normalizer.ForSource(TestPath, TestSource, CommitId, null, out _);
         var source = new TestSourceSnapshot(
-            true, true, true, CommitId, "repo", TestPath,
+            true, true, true, CommitId, "repo", null, TestPath,
             [new SourceFileSnapshot(TestPath, TestSource, sourceItem.Id, CommitId, null)],
             [], []);
         var evidence = new[]

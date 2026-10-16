@@ -32,6 +32,32 @@ public interface IAzureDevOpsClient
         CancellationToken cancellationToken);
 }
 
+public interface ISourceRepositoryClient
+{
+    string ProviderName { get; }
+
+    bool Supports(string repositoryType);
+
+    Task<RepositoryCommit?> GetVerifiedCommitAsync(
+        RepositoryInfo repository,
+        string commitId,
+        CancellationToken cancellationToken);
+
+    Task<IReadOnlyList<RepositoryItem>> GetRepositoryItemsAsync(
+        RepositoryInfo repository,
+        string commitId,
+        CancellationToken cancellationToken);
+
+    Task<string?> GetRepositoryFileAsync(
+        RepositoryInfo repository,
+        string path,
+        string commitId,
+        int maxBytes,
+        CancellationToken cancellationToken);
+
+    string CreatePinnedSourceUrl(RepositoryInfo repository, string path, string commitId);
+}
+
 public interface ILLMProvider
 {
     Task<ProviderResponse> CompleteAsync(LlmRequest request, CancellationToken cancellationToken);

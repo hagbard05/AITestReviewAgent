@@ -147,7 +147,7 @@ public sealed class TestSourceCollector(
             var missing = new[] { reason }.Concat(missingFiles.Select(path => $"Could not retrieve repository file: {path}")).ToArray();
             return (
                 new TestSourceSnapshot(
-                    true, false, false, verifiedCommit, repo.Id, null, Array.Empty<SourceFileSnapshot>(), missing,
+                    true, false, false, verifiedCommit, repo.Id, null, null, Array.Empty<SourceFileSnapshot>(), missing,
                     new[] { $"Source scan was limited to {candidates.Length} files and {options.MaxSourceCharacters} characters." }),
                 new[] { normalizer.ForCommit(verifiedCommit, repo.Id, repo.Name, commit.Timestamp) });
         }
@@ -234,6 +234,7 @@ public sealed class TestSourceCollector(
                 relevantSourcesComplete,
                 verifiedCommit,
                 repo.Id,
+                null,
                 testSourceEvidence.Path,
                 sourceFiles,
                 missingDependencies,
@@ -247,7 +248,7 @@ public sealed class TestSourceCollector(
     {
         var snapshot = new TestSourceSnapshot(
             false, false, false, build.SourceVersion, build.Repository?.Id, null,
-            Array.Empty<SourceFileSnapshot>(), new[] { reason }, new[] { reason });
+            null, Array.Empty<SourceFileSnapshot>(), new[] { reason }, new[] { reason });
         return (snapshot, new[]
         {
             normalizer.Unavailable("source-revision", EvidenceType.RepositoryMetadata, "Azure Repos source", reason)

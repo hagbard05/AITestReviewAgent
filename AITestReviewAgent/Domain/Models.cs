@@ -46,6 +46,12 @@ public sealed record InvestigationRequest(int BuildId, int TestResultId, int? Te
 
 public sealed record RepositoryInfo(string Id, string Name, string Type, string Url);
 
+public sealed record SourceRepositoryMetadata(
+    string Provider,
+    string RepositoryId,
+    string RepositoryUrl,
+    string Revision);
+
 public sealed record PipelineRun(
     int Id,
     string Name,
@@ -134,6 +140,7 @@ public sealed record TestSourceSnapshot(
     bool RelevantSourcesVerified,
     string CommitId,
     string? RepositoryId,
+    SourceRepositoryMetadata? Provenance,
     string? TestSourcePath,
     IReadOnlyList<SourceFileSnapshot> Files,
     IReadOnlyList<string> MissingDependencies,
