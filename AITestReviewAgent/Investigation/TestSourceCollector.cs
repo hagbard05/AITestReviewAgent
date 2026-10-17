@@ -1,14 +1,14 @@
 using System.Text.RegularExpressions;
-using AITestReviewAgent.AzureDevOps;
 using AITestReviewAgent.Configuration;
 using AITestReviewAgent.Domain;
 using AITestReviewAgent.Evidence;
 using AITestReviewAgent.Security;
+using AITestReviewAgent.SourceControl;
 
 namespace AITestReviewAgent.Investigation;
 
 public sealed class TestSourceCollector(
-    IAzureDevOpsClient azureDevOps,
+    IEnumerable<ISourceRepositoryClient> sourceClients,
     AzureDevOpsOptions options,
     EvidenceNormalizer normalizer)
 {
@@ -39,6 +39,15 @@ public sealed class TestSourceCollector(
             return Missing(build, "The build does not identify an accessible Git repository.");
         }
 
+        var sourceClient = sourceClients.FirstOrDefault(client => client.Supports(repo.Type));
+        if (sourceClient is null)
+        {
+            return Missing(
+                build,
+                $"No source provider is registered for repository type '{repo.Type}' and URL '{repo.Url}'.",
+                repo.Type);
+        }
+
         if (!Regex.IsMatch(build.SourceVersion, @"\A[0-9a-fA-F]{40}([0-9a-fA-F]{24})?\z"))
         {
             return Missing(build, "The build does not provide a full Git commit SHA; exact source revision cannot be verified.");
@@ -47,29 +56,34 @@ public sealed class TestSourceCollector(
         RepositoryCommit? commit;
         try
         {
-            commit = await azureDevOps.GetVerifiedCommitAsync(
-                repo.Id, build.SourceVersion, cancellationToken);
+            commit = await sourceClient.GetVerifiedCommitAsync(repo, build.SourceVersion, cancellationToken);
         }
-        catch (AzureDevOpsException exception)
+        catch (SourceRepositoryException exception)
         {
-            return Missing(build, $"Could not verify the build commit in Azure Repos: {exception.Message}");
+            return Missing(build, exception.Message, sourceClient.ProviderName);
         }
 
         if (commit is null
             || !string.Equals(commit.CommitId, build.SourceVersion, StringComparison.OrdinalIgnoreCase))
         {
-            return Missing(build, "Azure Repos did not verify the build's exact source commit.");
+            return Missing(
+                build,
+                $"{sourceClient.ProviderName} did not verify the build's exact source commit '{build.SourceVersion}'.",
+                sourceClient.ProviderName);
         }
 
         var verifiedCommit = commit.CommitId;
         IReadOnlyList<RepositoryItem> tree;
         try
         {
-            tree = await azureDevOps.GetRepositoryItemsAsync(repo.Id, verifiedCommit, cancellationToken);
+            tree = await sourceClient.GetRepositoryItemsAsync(repo, commit, cancellationToken);
         }
-        catch (AzureDevOpsException exception)
+        catch (SourceRepositoryException exception)
         {
-            return Missing(build, $"Could not list repository files at the build commit: {exception.Message}");
+            return Missing(
+                build,
+                $"{sourceClient.ProviderName} could not list repository files at the build commit: {exception.Message}",
+                sourceClient.ProviderName);
         }
 
         var treeTruncated = tree.Any(item => item.IsTreeTruncationMarker);
@@ -88,7 +102,7 @@ public sealed class TestSourceCollector(
         var collected = new List<(RepositoryItem Item, string Content)>();
         var truncatedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var remainingCharacters = options.MaxSourceCharacters;
-        var missingFiles = new List<string>();
+        var missingFiles = new List<(string Path, string Error)>();
         foreach (var item in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -101,18 +115,18 @@ public sealed class TestSourceCollector(
             string? content;
             try
             {
-                content = await azureDevOps.GetRepositoryFileAsync(
-                    repo.Id, item.Path, verifiedCommit, byteLimit, cancellationToken);
+                content = await sourceClient.GetRepositoryFileAsync(
+                    repo, item.Path, verifiedCommit, byteLimit, cancellationToken);
             }
-            catch (AzureDevOpsException)
+            catch (SourceRepositoryException exception)
             {
-                missingFiles.Add(item.Path);
+                missingFiles.Add((item.Path, exception.Message));
                 continue;
             }
 
             if (content is null)
             {
-                missingFiles.Add(item.Path);
+                missingFiles.Add((item.Path, $"{sourceClient.ProviderName} did not return the file at the verified commit."));
                 continue;
             }
 
@@ -144,12 +158,14 @@ public sealed class TestSourceCollector(
             var reason = matchingFiles.Length == 0
                 ? "The exact test method was not found in the bounded source snapshot."
                 : "The test method matched multiple source files and could not be identified unambiguously.";
-            var missing = new[] { reason }.Concat(missingFiles.Select(path => $"Could not retrieve repository file: {path}")).ToArray();
+            var missing = new[] { reason }.Concat(missingFiles.Select(file =>
+                $"Could not retrieve repository file '{file.Path}': {file.Error}")).ToArray();
             return (
                 new TestSourceSnapshot(
-                    true, false, false, verifiedCommit, repo.Id, null, null, Array.Empty<SourceFileSnapshot>(), missing,
+                    true, false, false, verifiedCommit, repo.Id,
+                    CreateProvenance(sourceClient, repo, verifiedCommit), null, Array.Empty<SourceFileSnapshot>(), missing,
                     new[] { $"Source scan was limited to {candidates.Length} files and {options.MaxSourceCharacters} characters." }),
-                new[] { normalizer.ForCommit(verifiedCommit, repo.Id, repo.Name, commit.Timestamp) });
+                new[] { normalizer.ForCommit(verifiedCommit, repo.Id, repo.Name, commit.Timestamp, sourceClient.ProviderName) });
         }
 
         var testFile = matchingFiles[0];
@@ -161,14 +177,14 @@ public sealed class TestSourceCollector(
         var sourceFiles = new List<SourceFileSnapshot>();
         var evidence = new List<EvidenceItem>
         {
-            normalizer.ForCommit(verifiedCommit, repo.Id, repo.Name, commit.Timestamp)
+            normalizer.ForCommit(verifiedCommit, repo.Id, repo.Name, commit.Timestamp, sourceClient.ProviderName)
         };
 
         foreach (var file in relatedFiles)
         {
-            var pinnedUrl = CreatePinnedSourceUrl(repo.Id, file.Item.Path, verifiedCommit);
+            var pinnedUrl = sourceClient.CreatePinnedSourceUrl(repo, file.Item.Path, verifiedCommit);
             var sourceEvidence = normalizer.ForSource(
-                file.Item.Path, file.Content, verifiedCommit, pinnedUrl, out _, commit.Timestamp);
+                file.Item.Path, file.Content, verifiedCommit, pinnedUrl, out _, commit.Timestamp, sourceClient.ProviderName);
             sourceFiles.Add(new SourceFileSnapshot(
                 sourceEvidence.Path ?? file.Item.Path,
                 file.Content,
@@ -219,13 +235,13 @@ public sealed class TestSourceCollector(
 
         if (missingFiles.Count > 0)
         {
-            limitations.Add($"Could not retrieve {missingFiles.Count} repository file(s) at the build commit.");
+            limitations.Add($"Could not retrieve {missingFiles.Count} {sourceClient.ProviderName} file(s) at the build commit.");
         }
 
         limitations.Add("Helper and fixture discovery is static and bounded; generated, reflective, or external dependencies may not be included.");
         var missingDependencies = GetUnresolvedReferencedTypes(testFile.Content, collected)
             .Concat(missingFiles.Select(path =>
-                $"Could not retrieve repository file '{path}' at the build commit; it may contain a required helper or test dependency."))
+                $"Could not retrieve repository file '{path.Path}' at the build commit: {path.Error}"))
             .ToArray();
         return (
             new TestSourceSnapshot(
@@ -234,7 +250,7 @@ public sealed class TestSourceCollector(
                 relevantSourcesComplete,
                 verifiedCommit,
                 repo.Id,
-                null,
+                CreateProvenance(sourceClient, repo, verifiedCommit),
                 testSourceEvidence.Path,
                 sourceFiles,
                 missingDependencies,
@@ -244,16 +260,31 @@ public sealed class TestSourceCollector(
 
     private (TestSourceSnapshot Snapshot, IReadOnlyList<EvidenceItem> Evidence) Missing(
         PipelineRun build,
-        string reason)
+        string reason,
+        string? providerName = null)
     {
+        var repository = build.Repository;
+        var provenance = repository is null
+            ? null
+            : new SourceRepositoryMetadata(
+                providerName ?? repository.Type,
+                repository.Id,
+                repository.Url,
+                build.SourceVersion);
         var snapshot = new TestSourceSnapshot(
-            false, false, false, build.SourceVersion, build.Repository?.Id, null,
+            false, false, false, build.SourceVersion, repository?.Id, provenance,
             null, Array.Empty<SourceFileSnapshot>(), new[] { reason }, new[] { reason });
         return (snapshot, new[]
         {
-            normalizer.Unavailable("source-revision", EvidenceType.RepositoryMetadata, "Azure Repos source", reason)
+            normalizer.Unavailable("source-revision", EvidenceType.RepositoryMetadata,
+                $"{providerName ?? repository?.Type ?? "Git"} source", reason)
         });
     }
+
+    private static SourceRepositoryMetadata CreateProvenance(
+        ISourceRepositoryClient sourceClient,
+        RepositoryInfo repository,
+        string revision) => new(sourceClient.ProviderName, repository.Id, repository.Url, revision);
 
     private static IEnumerable<string> GetMethodNames(TestCaseResult test)
     {
@@ -341,12 +372,6 @@ public sealed class TestSourceCollector(
 
     private static bool IsTestPath(string path) =>
         Regex.IsMatch(path, @"(^|[/\\])(test|tests|spec|specs)([/\\]|$)", RegexOptions.IgnoreCase);
-
-    private string CreatePinnedSourceUrl(string repositoryId, string path, string commitId) =>
-        $"{options.Organization.TrimEnd('/')}/{Uri.EscapeDataString(options.Project)}"
-        + $"/_apis/git/repositories/{Uri.EscapeDataString(repositoryId)}/items"
-        + $"?path={Uri.EscapeDataString(path)}&versionDescriptor.version={Uri.EscapeDataString(commitId)}"
-        + "&versionDescriptor.versionType=commit&api-version=7.1";
 
     private static bool IsRelatedConfigurationOrData(string path, string testPath)
     {

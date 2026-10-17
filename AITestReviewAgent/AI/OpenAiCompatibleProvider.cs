@@ -5,6 +5,8 @@ using System.Text.Json;
 using AITestReviewAgent.Configuration;
 using AITestReviewAgent.Domain;
 using AITestReviewAgent.Infrastructure;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace AITestReviewAgent.AI;
 
@@ -12,15 +14,23 @@ public sealed class OpenAiCompatibleProvider : ILLMProvider
 {
     private readonly HttpClient _httpClient;
     private readonly AiOptions _options;
+    private readonly ILogger<OpenAiCompatibleProvider> _logger;
 
-    public OpenAiCompatibleProvider(HttpClient httpClient, AiOptions options)
+    public OpenAiCompatibleProvider(
+        HttpClient httpClient,
+        AiOptions options,
+        ILogger<OpenAiCompatibleProvider>? logger = null)
     {
         _httpClient = httpClient;
         _options = options;
+        _logger = logger ?? NullLogger<OpenAiCompatibleProvider>.Instance;
         _options.Validate(requireCredentials: true);
         _httpClient.Timeout = TimeSpan.FromSeconds(_options.TimeoutSeconds);
-        _httpClient.DefaultRequestHeaders.Authorization =
-            new AuthenticationHeaderValue("Bearer", _options.ApiKey);
+        if (!string.IsNullOrWhiteSpace(_options.ApiKey))
+        {
+            _httpClient.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", _options.ApiKey);
+        }
     }
 
     public async Task<ProviderResponse> CompleteAsync(LlmRequest request, CancellationToken cancellationToken)
@@ -33,7 +43,7 @@ public sealed class OpenAiCompatibleProvider : ILLMProvider
                 new { role = "system", content = request.SystemPrompt },
                 new { role = "user", content = request.UserPrompt }
             },
-            response_format = new { type = "json_object" },
+            response_format = new { type = "text" },
             max_tokens = request.MaxOutputTokens,
             temperature = _options.Temperature
         });
@@ -62,14 +72,22 @@ public sealed class OpenAiCompatibleProvider : ILLMProvider
         {
             if (!response.IsSuccessStatusCode)
             {
+                var diagnostics = await ReadSafeErrorDiagnosticsAsync(response, cancellationToken);
+                _logger.LogWarning(
+                    "AI provider {Provider} endpoint {Endpoint} returned HTTP {StatusCode}. Safe response diagnostics: {Diagnostics}",
+                    "OpenAI-compatible",
+                    GetSafeEndpoint(_options.Endpoint),
+                    (int)response.StatusCode,
+                    diagnostics);
+
                 if (IsTransient(response.StatusCode))
                 {
                     throw new LlmProviderException(
-                        $"The AI provider returned transient HTTP {(int)response.StatusCode}; retry the investigation later.");
+                        $"The OpenAI-compatible provider returned transient HTTP {(int)response.StatusCode}; retry the investigation later.");
                 }
 
                 throw new LlmProviderException(
-                    $"The AI provider rejected the request with HTTP {(int)response.StatusCode}; check provider configuration and quota.");
+                    $"The OpenAI-compatible provider rejected the request with HTTP {(int)response.StatusCode}; check the configured endpoint, model ID, and provider error diagnostics.");
             }
 
             var json = await ReadResponseAsync(response, 1_000_000, cancellationToken);
@@ -144,6 +162,81 @@ public sealed class OpenAiCompatibleProvider : ILLMProvider
         && value.TryGetInt64(out var count)
             ? count
             : null;
+
+    private static async Task<string> ReadSafeErrorDiagnosticsAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        const int maxDiagnosticBytes = 16_384;
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var output = new MemoryStream();
+        var buffer = new byte[4096];
+        while (output.Length <= maxDiagnosticBytes)
+        {
+            var read = await stream.ReadAsync(
+                buffer.AsMemory(0, Math.Min(buffer.Length, maxDiagnosticBytes + 1 - (int)output.Length)),
+                cancellationToken);
+            if (read == 0)
+            {
+                break;
+            }
+
+            output.Write(buffer, 0, read);
+        }
+
+        if (output.Length > maxDiagnosticBytes)
+        {
+            return "error response exceeded diagnostic size limit; response body omitted";
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(output.ToArray());
+            var root = document.RootElement;
+            var error = root.TryGetProperty("error", out var errorElement)
+                ? errorElement
+                : root;
+            var safeFields = new[] { "code", "type", "param" }
+                .Where(name => error.ValueKind == JsonValueKind.Object
+                    && error.TryGetProperty(name, out var value)
+                    && value.ValueKind == JsonValueKind.String)
+                .Select(name => $"{name}={SanitizeDiagnosticValue(error.GetProperty(name).GetString())}")
+                .ToArray();
+            return safeFields.Length == 0
+                ? "error response received; free-text message omitted to protect request evidence"
+                : string.Join(", ", safeFields)
+                    + "; free-text message omitted to protect request evidence";
+        }
+        catch (JsonException)
+        {
+            return "non-JSON error response received; response body omitted to protect request evidence";
+        }
+    }
+
+    private static string SanitizeDiagnosticValue(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "(empty)";
+        }
+
+        var safeValue = new string(value.Take(100)
+            .Select(character => char.IsLetterOrDigit(character) || character is '_' or '-' or '.'
+                ? character
+                : '_')
+            .ToArray());
+        return safeValue;
+    }
+
+    private static string GetSafeEndpoint(string endpoint)
+    {
+        if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri))
+        {
+            return "(invalid endpoint)";
+        }
+
+        return $"{uri.Scheme}://{uri.Authority}{uri.AbsolutePath}";
+    }
 
     private static bool IsTransient(HttpStatusCode status) =>
         status is HttpStatusCode.RequestTimeout

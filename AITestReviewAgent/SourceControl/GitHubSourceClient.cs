@@ -67,21 +67,44 @@ public sealed class GitHubSourceClient : ISourceRepositoryClient
 			timestamp = parsedDate;
 		}
 
-		return new RepositoryCommit(returnedSha!, timestamp);
+		var treeId = root.TryGetProperty("commit", out var commitData)
+			&& commitData.TryGetProperty("tree", out var tree)
+			? GetString(tree, "sha")
+			: null;
+		if (treeId is null || treeId.Length != 40 || treeId.Any(character => !Uri.IsHexDigit(character)))
+		{
+			throw new SourceRepositoryException(
+				$"GitHub verified commit '{commitId}' but did not return a valid tree SHA; source files cannot be listed safely.");
+		}
+
+		return new RepositoryCommit(returnedSha!, timestamp, treeId);
 	}
 
 	public async Task<IReadOnlyList<RepositoryItem>> GetRepositoryItemsAsync(
 		RepositoryInfo repository,
-		string commitId,
+		RepositoryCommit commit,
 		CancellationToken cancellationToken)
 	{
 		var repo = ParseRepository(repository);
+		var treeId = commit.TreeId;
+		if (treeId is null || treeId.Length != 40 || treeId.Any(character => !Uri.IsHexDigit(character)))
+		{
+			throw new SourceRepositoryException(
+				$"GitHub commit '{commit.CommitId}' has no valid verified tree SHA.");
+		}
+
 		using var response = await SendGetAsync(
-			new Uri(ApiBaseUrl + $"repos/{repo.Owner}/{repo.Name}/git/trees/{Uri.EscapeDataString(commitId)}?recursive=1"),
+			new Uri(ApiBaseUrl + $"repos/{repo.Owner}/{repo.Name}/git/trees/{Uri.EscapeDataString(treeId)}?recursive=1"),
 			cancellationToken);
 		EnsureSuccess(response, "list source files");
 		using var document = await ReadJsonAsync(response, 8_000_000, cancellationToken);
 		var root = document.RootElement;
+		if (!string.Equals(GetString(root, "sha"), treeId, StringComparison.OrdinalIgnoreCase))
+		{
+			throw new SourceRepositoryException(
+				$"GitHub returned a repository tree that does not match the verified tree SHA for commit '{commit.CommitId}'.");
+		}
+
 		var items = new List<RepositoryItem>();
 		if (root.TryGetProperty("tree", out var tree) && tree.ValueKind == JsonValueKind.Array)
 		{
@@ -98,7 +121,7 @@ public sealed class GitHubSourceClient : ISourceRepositoryClient
 				var isBinary = !isBlob || (item.TryGetProperty("size", out var size)
 					&& size.TryGetInt64(out var byteCount)
 					&& byteCount > 2_000_000);
-				items.Add(new RepositoryItem(path, isTree, isBinary, CreatePinnedSourceUrl(repository, path, commitId)));
+				items.Add(new RepositoryItem(path, isTree, isBinary, CreatePinnedSourceUrl(repository, path, commit.CommitId)));
 			}
 		}
 

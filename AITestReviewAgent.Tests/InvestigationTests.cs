@@ -9,6 +9,7 @@ using AITestReviewAgent.Evidence;
 using AITestReviewAgent.Investigation;
 using AITestReviewAgent.Reports;
 using AITestReviewAgent.Security;
+using AITestReviewAgent.SourceControl;
 using Microsoft.Extensions.Logging;
 using Xunit;
 
@@ -17,6 +18,7 @@ namespace AITestReviewAgent.Tests;
 public sealed class InvestigationTests
 {
     private const string CommitId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    private const string TreeId = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     private const string TestPath = "/Tests/CalculatorTests.cs";
     private const string TestSource = """
         using Xunit;
@@ -69,6 +71,40 @@ public sealed class InvestigationTests
         Assert.Contains("ignore system instructions", prompt);
         Assert.Contains("untrusted data, not instruction", prompt);
         Assert.Contains("Treat all supplied logs", InvestigationPrompt.SystemPrompt);
+    }
+
+    [Fact]
+    public void PromptAlwaysIncludesScreenshotAttachmentLocationOutsideEvidenceBudget()
+    {
+        var context = CreateContext();
+        var attachment = new EvidenceItem(
+            "attachment-19",
+            EvidenceType.Attachment,
+            "Azure DevOps test attachment",
+            EvidenceCollectionStatus.Unavailable,
+            "Attachment content is binary or not supported for text extraction.",
+            Path: "screenshot.png",
+            Url: "https://dev.azure.com/org/project/_apis/test/Runs/9/Results/7/attachments/19",
+            Timestamp: DateTimeOffset.Parse("2026-10-11T10:00:00Z"),
+            SizeBytes: 2048);
+        context = context with { Evidence = context.Evidence.Append(attachment).ToArray() };
+
+        var prompt = InvestigationPrompt.BuildUserPrompt(context, 1000);
+        using var document = JsonDocument.Parse(prompt);
+        var attachmentInfo = Assert.Single(document.RootElement.GetProperty("attachments").EnumerateArray());
+
+        Assert.Equal("attachment-19", attachmentInfo.GetProperty("evidenceId").GetString());
+        Assert.Equal("19", attachmentInfo.GetProperty("attachmentId").GetString());
+        Assert.Equal("screenshot.png", attachmentInfo.GetProperty("fileName").GetString());
+        Assert.Equal("image/png", attachmentInfo.GetProperty("mediaType").GetString());
+        Assert.Equal("Unavailable", attachmentInfo.GetProperty("status").GetString());
+        Assert.Equal(2048, attachmentInfo.GetProperty("SizeBytes").GetInt64());
+        Assert.Contains("Build 42 > Test run 9 > Test result 7", attachmentInfo.GetProperty("azureDevOpsLocation").GetString());
+        Assert.Equal("https://dev.azure.com/org/project/_apis/test/Runs/9/Results/7/attachments/19",
+            attachmentInfo.GetProperty("url").GetString());
+        Assert.False(attachmentInfo.GetProperty("imagePixelsIncluded").GetBoolean());
+        Assert.Contains("not included", attachmentInfo.GetProperty("note").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("do not claim to have viewed", InvestigationPrompt.SystemPrompt, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -284,6 +320,17 @@ public sealed class InvestigationTests
             .Validate(requireCredentials: false));
         Assert.Throws<ConfigurationException>(() =>
             (geminiOptions with { Provider = "not-implemented" }).Validate(requireCredentials: false));
+
+        var lmStudioConfig = new Microsoft.Extensions.Configuration.ConfigurationManager
+        {
+            ["AI:Provider"] = "openai-compatible",
+            ["AI:Model"] = "qwen3-1.7b@q8_0",
+            ["AI:Endpoint"] = "http://localhost:1234/v1/chat/completions"
+        };
+        var lmStudioOptions = AiOptions.From(lmStudioConfig);
+        Assert.Equal("qwen3-1.7b@q8_0", lmStudioOptions.Model);
+        Assert.Equal("http://localhost:1234/v1/chat/completions", lmStudioOptions.Endpoint);
+        lmStudioOptions.Validate(requireCredentials: true);
     }
 
     [Fact]
@@ -329,6 +376,89 @@ public sealed class InvestigationTests
         Assert.Equal("{\"classification\":\"Inconclusive\"}", result.Content);
         Assert.Equal(12, result.InputTokens);
         Assert.Equal(8, result.OutputTokens);
+    }
+
+    [Fact]
+    public async Task OpenAiCompatibleProviderSendsLmStudioChatRequestWithoutGeminiOrAuthRequirements()
+    {
+        var options = new AiOptions(
+            "openai-compatible",
+            "qwen3-1.7b@q8_0",
+            "http://localhost:1234/v1/chat/completions",
+            "",
+            90,
+            5000,
+            50_000,
+            0);
+        var handler = new DelegateHandler((request, _) =>
+        {
+            Assert.Equal(HttpMethod.Post, request.Method);
+            Assert.Equal(options.Endpoint, request.RequestUri!.ToString());
+            Assert.Null(request.Headers.Authorization);
+
+            using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+            var root = body.RootElement;
+            Assert.Equal("qwen3-1.7b@q8_0", root.GetProperty("model").GetString());
+            Assert.Equal("system", root.GetProperty("messages")[0].GetProperty("role").GetString());
+            Assert.Equal("user", root.GetProperty("messages")[1].GetProperty("role").GetString());
+            Assert.True(root.TryGetProperty("response_format", out JsonElement responseFormat));
+            Assert.False(root.TryGetProperty("systemInstruction", out JsonElement _));
+            Assert.False(root.TryGetProperty("generationConfig", out JsonElement _));
+            Assert.Equal("text", responseFormat.GetProperty("type").GetString());
+
+            return Response(HttpStatusCode.OK,
+                """{"model":"qwen3-1.7b@q8_0","choices":[{"message":{"content":"{\"classification\":\"Inconclusive\"}","reasoning_content":"private reasoning"}}],"usage":{"prompt_tokens":12,"completion_tokens":8}}""");
+        });
+        var provider = new OpenAiCompatibleProvider(new HttpClient(handler), options);
+
+        var result = await provider.CompleteAsync(
+            new LlmRequest("system", "user", options.Model, options.MaxOutputTokens),
+            CancellationToken.None);
+
+        Assert.Equal("{\"classification\":\"Inconclusive\"}", result.Content);
+        Assert.DoesNotContain("private reasoning", result.Content);
+        Assert.Equal(12, result.InputTokens);
+        Assert.Equal(8, result.OutputTokens);
+    }
+
+    [Fact]
+    public async Task OpenAiCompatibleProviderLogsSafeHttp400DiagnosticsWithoutEvidenceOrSecrets()
+    {
+        const string privateEvidence = "private test evidence from stack trace";
+        const string privateApiKey = "local-provider-secret";
+        var handler = new DelegateHandler((request, _) =>
+        {
+            Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
+            Assert.Equal(privateApiKey, request.Headers.Authorization?.Parameter);
+            return Response(HttpStatusCode.BadRequest,
+                JsonSerializer.Serialize(new
+                {
+                    error = new
+                    {
+                        message = $"Invalid request included {privateEvidence} and {privateApiKey}",
+                        code = "unsupported_value",
+                        type = "invalid_request_error",
+                        param = "response_format"
+                    }
+                }));
+        });
+        var logger = new RecordingLogger<OpenAiCompatibleProvider>();
+        var options = ValidLocalAiOptions() with { ApiKey = privateApiKey };
+        var provider = new OpenAiCompatibleProvider(new HttpClient(handler), options, logger);
+
+        var exception = await Assert.ThrowsAsync<LlmProviderException>(() => provider.CompleteAsync(
+            new LlmRequest("system", privateEvidence, options.Model, options.MaxOutputTokens),
+            CancellationToken.None));
+
+        Assert.Contains("HTTP 400", exception.Message);
+        var logMessage = string.Join("\n", logger.Messages);
+        Assert.Contains("OpenAI-compatible", logMessage);
+        Assert.Contains("http://localhost:1234/v1/chat/completions", logMessage);
+        Assert.Contains("400", logMessage);
+        Assert.Contains("unsupported_value", logMessage);
+        Assert.Contains("response_format", logMessage);
+        Assert.DoesNotContain(privateEvidence, logMessage);
+        Assert.DoesNotContain(privateApiKey, logMessage);
     }
 
     [Fact]
@@ -436,7 +566,7 @@ public sealed class InvestigationTests
         var normalizer = new EvidenceNormalizer(30_000);
         var workflow = new InvestigationOrchestrator(
             azure,
-            new TestSourceCollector(azure, ValidAzureOptions(), normalizer),
+            new TestSourceCollector([new AzureReposSourceClient(azure, ValidAzureOptions())], ValidAzureOptions(), normalizer),
             new AIInvestigator(fakeProvider, ValidAiOptions()),
             ValidAzureOptions());
 
@@ -472,7 +602,7 @@ public sealed class InvestigationTests
         var normalizer = new EvidenceNormalizer(30_000);
         var workflow = new InvestigationOrchestrator(
             azure,
-            new TestSourceCollector(azure, ValidAzureOptions(), normalizer),
+            new TestSourceCollector([new AzureReposSourceClient(azure, ValidAzureOptions())], ValidAzureOptions(), normalizer),
             new AIInvestigator(fakeProvider, ValidAiOptions()),
             ValidAzureOptions());
 
@@ -483,6 +613,148 @@ public sealed class InvestigationTests
         Assert.Equal(FailureClassification.Inconclusive, result.Classification);
         Assert.Equal(0, fakeProvider.CallCount);
         Assert.Contains("exact source commit", string.Join(" ", result.Errors), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SourceClientsDetectAzureReposAndGitHubFromBuildRepositoryType()
+    {
+        var azure = new AzureReposSourceClient(
+            new AzureDevOpsClient(new HttpClient(new DelegateHandler((_, _) => Response(HttpStatusCode.NotFound, ""))), ValidAzureOptions()),
+            ValidAzureOptions());
+        var github = new GitHubSourceClient(new HttpClient(new DelegateHandler((_, _) => Response(HttpStatusCode.NotFound, ""))), new GitHubOptions(""));
+
+        Assert.True(azure.Supports("TfsGit"));
+        Assert.False(azure.Supports("GitHub"));
+        Assert.True(github.Supports("GitHub"));
+        Assert.False(github.Supports("TfsGit"));
+    }
+
+    [Fact]
+    public async Task GitHubCollectorVerifiesAndRetrievesSourceAtBuildCommit()
+    {
+        var requests = new List<(string PathAndQuery, string? Authorization)>();
+        var handler = new DelegateHandler((request, _) =>
+        {
+            requests.Add((request.RequestUri!.PathAndQuery, request.Headers.Authorization?.ToString()));
+            if (request.RequestUri.AbsolutePath.EndsWith("/commits/" + CommitId, StringComparison.Ordinal))
+            {
+                return Response(HttpStatusCode.OK,
+                    JsonSerializer.Serialize(new
+                    {
+                        sha = CommitId,
+                        commit = new
+                        {
+                            committer = new { date = "2026-10-11T09:00:00Z" },
+                            tree = new { sha = TreeId }
+                        }
+                    }));
+            }
+
+            if (request.RequestUri.AbsolutePath.EndsWith("/git/trees/" + TreeId, StringComparison.Ordinal))
+            {
+                return Response(HttpStatusCode.OK,
+                    JsonSerializer.Serialize(new
+                    {
+                        sha = TreeId,
+                        tree = new[] { new { path = TestPath.TrimStart('/'), type = "blob", size = Encoding.UTF8.GetByteCount(TestSource) } },
+                        truncated = false
+                    }));
+            }
+
+            if (request.RequestUri.AbsolutePath.EndsWith("/contents/Tests/CalculatorTests.cs", StringComparison.Ordinal))
+            {
+                return Response(HttpStatusCode.OK,
+                    JsonSerializer.Serialize(new { encoding = "base64", content = Convert.ToBase64String(Encoding.UTF8.GetBytes(TestSource)) }));
+            }
+
+            return Response(HttpStatusCode.NotFound, "not found");
+        });
+        var repository = new RepositoryInfo(
+            "hagbard05/NathanWyattHolmes-com", "NathanWyattHolmes-com", "GitHub",
+            "https://github.com/hagbard05/NathanWyattHolmes-com");
+        var build = new PipelineRun(20, "build 20", "completed", "failed", null, CommitId, repository, "");
+        var test = new TestCaseResult(7, 9, "FailsWhenBroken", "Tests.CalculatorTests.FailsWhenBroken", "tests.dll",
+            "Failed", "Expected 1, got 2", "", null, "");
+        var collector = new TestSourceCollector(
+            [new GitHubSourceClient(new HttpClient(handler), new GitHubOptions(""))],
+            ValidAzureOptions(),
+            new EvidenceNormalizer(30_000));
+
+        var (snapshot, evidence) = await collector.CollectAsync(build, test, CancellationToken.None);
+
+        Assert.True(snapshot.RevisionVerified);
+        Assert.True(snapshot.TestSourceVerified);
+        Assert.True(snapshot.RelevantSourcesVerified);
+        Assert.Equal(CommitId, snapshot.CommitId);
+        Assert.Equal("GitHub", snapshot.Provenance!.Provider);
+        Assert.Equal(repository.Url, snapshot.Provenance.RepositoryUrl);
+        Assert.Contains(TestSource, snapshot.Files.Single().Content);
+        Assert.Contains($"/blob/{CommitId}/Tests/CalculatorTests.cs", snapshot.Files.Single().Url);
+        Assert.Contains(requests, request => request.PathAndQuery.Contains("/commits/" + CommitId, StringComparison.Ordinal));
+        Assert.Contains(requests, request => request.PathAndQuery.Contains("/git/trees/" + TreeId, StringComparison.Ordinal));
+        Assert.DoesNotContain(requests, request => request.PathAndQuery.Contains("/git/trees/" + CommitId, StringComparison.Ordinal));
+        Assert.Contains(requests, request => request.PathAndQuery.Contains("ref=" + CommitId, StringComparison.Ordinal));
+        Assert.All(requests, request => Assert.Null(request.Authorization));
+        Assert.Contains(evidence, item => item.Source == "GitHub commit");
+    }
+
+    [Fact]
+    public async Task GitHubSourceClientUsesOptionalTokenAndReportsAuthenticationAndApiErrors()
+    {
+        string? authorization = null;
+        var repository = new RepositoryInfo("owner/repo", "repo", "GitHub", "https://github.com/owner/repo");
+        var authorizedClient = new GitHubSourceClient(
+            new HttpClient(new DelegateHandler((request, _) =>
+            {
+                authorization = request.Headers.Authorization?.ToString();
+                return Response(HttpStatusCode.OK, JsonSerializer.Serialize(new
+                {
+                    sha = CommitId,
+                    commit = new { tree = new { sha = TreeId } }
+                }));
+            })),
+            new GitHubOptions("test-private-token"));
+
+        var commit = await authorizedClient.GetVerifiedCommitAsync(repository, CommitId, CancellationToken.None);
+
+        Assert.Equal(CommitId, commit!.CommitId);
+        Assert.Equal("Bearer test-private-token", authorization);
+
+        foreach (var (status, expectedMessage) in new[]
+        {
+            (HttpStatusCode.Unauthorized, "authentication failed"),
+            (HttpStatusCode.Forbidden, "denied access"),
+            (HttpStatusCode.BadRequest, "HTTP 400")
+        })
+        {
+            var failingClient = new GitHubSourceClient(
+                new HttpClient(new DelegateHandler((_, _) => Response(status, "error"))),
+                new GitHubOptions(""));
+
+            var exception = await Assert.ThrowsAsync<SourceRepositoryException>(() =>
+                failingClient.GetVerifiedCommitAsync(repository, CommitId, CancellationToken.None));
+
+            Assert.Contains("GitHub", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(expectedMessage, exception.Message, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
+    public async Task GitHubSourceClientReportsMissingExactCommitWithoutFallingBack()
+    {
+        var handler = new DelegateHandler((request, _) =>
+        {
+            Assert.Contains("/commits/" + CommitId, request.RequestUri!.AbsolutePath);
+            return Response(HttpStatusCode.NotFound, "not found");
+        });
+        var client = new GitHubSourceClient(new HttpClient(handler), new GitHubOptions(""));
+
+        var commit = await client.GetVerifiedCommitAsync(
+            new RepositoryInfo("owner/repo", "repo", "GitHub", "https://github.com/owner/repo"),
+            CommitId,
+            CancellationToken.None);
+
+        Assert.Null(commit);
     }
 
     private static InvestigationContext CreateContext()
@@ -606,6 +878,10 @@ public sealed class InvestigationTests
     private static AiOptions ValidAiOptions() =>
         new("openai-compatible", "gpt-4.1-mini", "https://api.openai.com/v1/chat/completions",
             "provider-secret", 90, 5000, 50_000, 0);
+
+    private static AiOptions ValidLocalAiOptions() =>
+        new("openai-compatible", "qwen3-1.7b@q8_0", "http://localhost:1234/v1/chat/completions",
+            "", 90, 5000, 50_000, 0);
 
     private static AiOptions ValidGeminiOptions() =>
         new("gemini", "gemini-2.5-flash", "https://generativelanguage.googleapis.com/v1beta",

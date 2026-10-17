@@ -184,5 +184,5 @@ public sealed class InvestigationOrchestrator(
             request,
             context,
             "A definitive diagnosis was withheld because the failed test source and its relevant dependencies could not be fully verified at the build's exact commit.",
-            "Restore access to the build's exact Azure Repos commit and required source files, then investigate again.");
+            "Restore access to the build's exact source-provider commit and required source files, then investigate again.");
 }

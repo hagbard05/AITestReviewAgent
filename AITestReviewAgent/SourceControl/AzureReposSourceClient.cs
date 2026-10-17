@@ -32,18 +32,18 @@ public sealed class AzureReposSourceClient(
 
 	public async Task<IReadOnlyList<RepositoryItem>> GetRepositoryItemsAsync(
 		RepositoryInfo repository,
-		string commitId,
+		RepositoryCommit commit,
 		CancellationToken cancellationToken)
 	{
 		ValidateRepository(repository);
 		try
 		{
-			return await azureDevOps.GetRepositoryItemsAsync(repository.Id, commitId, cancellationToken);
+			return await azureDevOps.GetRepositoryItemsAsync(repository.Id, commit.CommitId, cancellationToken);
 		}
 		catch (AzureDevOps.AzureDevOpsException exception)
 		{
 			throw new SourceRepositoryException(
-				$"Azure Repos could not list files at commit '{commitId}': {exception.Message}");
+				$"Azure Repos could not list files at commit '{commit.CommitId}': {exception.Message}");
 		}
 	}
 

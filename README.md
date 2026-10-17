@@ -5,7 +5,7 @@ A read-only .NET 10 command-line MVP for investigating one failed test result fr
 ## Requirements
 
 - .NET 10 SDK.
-- Azure DevOps access to the target project and Git repository.
+- Azure DevOps access to the target project, plus source repository access (Azure Repos or GitHub).
 - An API key for either Google Gemini or an OpenAI Chat Completions-compatible endpoint for live AI investigations. Calls may incur provider charges.
 
 The project was modernized from the empty .NET Framework 4.7.2 shell to an SDK-style `net10.0` solution. No database or CI/CD integration other than Azure DevOps is used.
@@ -26,9 +26,19 @@ dotnet user-secrets --project .\AITestReviewAgent\AITestReviewAgent.csproj set "
 dotnet user-secrets --project .\AITestReviewAgent\AITestReviewAgent.csproj set "AI:ApiKey" "<API-key>"
 ```
 
-The initial Azure DevOps authentication method is a PAT. Grant only the read permissions needed to view builds, test runs/results/attachments, and repository contents. Typical PAT scopes are **Build: Read**, **Test Management: Read**, and **Code: Read**; the identity also needs corresponding project/build/test/repository read permissions. No write scope is used. Production Entra ID authentication is not implemented in this iteration.
+The initial Azure DevOps authentication method is a PAT. Grant only the read permissions needed to view builds, test runs/results/attachments, and Azure Repos contents. Typical PAT scopes are **Build: Read**, **Test Management: Read**, and **Code: Read**; the identity also needs corresponding project/build/test/repository read permissions. No write scope is used. Production Entra ID authentication is not implemented in this iteration.
+
+For Azure Pipelines builds using GitHub, the source provider is selected from the build's `repository.type` and validated against `repository.url`. Public GitHub repositories do not require a GitHub token. For private repositories, optionally provide a read-only GitHub token through User Secrets or `GitHub__Token`:
+
+```powershell
+dotnet user-secrets --project .\AITestReviewAgent\AITestReviewAgent.csproj set "GitHub:Token" "<read-only-token>"
+```
+
+GitHub commits are verified by full SHA, and files are fetched using that verified SHA; the collector never falls back to a branch or latest revision.
 
 `AI` settings select the provider, model, endpoint, request timeout, output-token limit, evidence-character limit, and temperature. Supported providers are `openai-compatible` and `gemini`. The API key is read from User Secrets or `AI__ApiKey`; never put it in `appsettings.json`.
+
+For LM Studio, use `AI:Provider = openai-compatible`, set `AI:Model` to the exact ID shown by `GET /v1/models`, and set `AI:Endpoint` to the full chat endpoint, such as `http://localhost:1234/v1/chat/completions`. Loopback OpenAI-compatible servers do not require `AI:ApiKey`; when provided, the key is sent as a Bearer token. The checked-in local example uses `qwen3-1.7b@q8_0`.
 
 To select Gemini, get an API key from Google AI Studio, store it using the User Secrets command above, and set:
 
@@ -61,13 +71,14 @@ If the build's full commit SHA cannot be verified, the repository is unavailable
 
 - `Domain/`: provider- and HTTP-independent models and interfaces.
 - `AzureDevOps/`: read-only REST client, bounded pagination, authentication, and transient GET/response retry handling.
+- `SourceControl/`: Azure Repos and GitHub clients selected from Azure Pipelines repository metadata; source retrieval is pinned to the verified build commit.
 - `Evidence/` and `Security/`: evidence normalization, secret redaction, truncation, and source provenance.
 - `Investigation/`: exact-commit test-source collection, bounded helper/config discovery, and deterministic workflow.
 - `AI/`: prompt boundary, OpenAI-compatible and native Google Gemini providers, structured response parsing, evidence-reference validation, and report construction.
 - `Program.cs`: CLI, configuration, dependency injection, and report presentation.
 - `AITestReviewAgent.Tests/`: offline unit, mocked HTTP, and synthetic end-to-end coverage.
 
-The model receives source files with one-based line numbers and stable evidence IDs. Its citations are checked against the collected package; unknown IDs or invalid source paths/line ranges fail the investigation. Unsupported claims are labeled. Logs, test output, source, and attachments are explicitly treated as untrusted data in the system prompt and serialized as data. Common credential formats are redacted, evidence is bounded, and binary attachments are referenced but not sent to the model. The investigator never executes commands or modifies Azure DevOps.
+The model receives source files with one-based line numbers and stable evidence IDs. Its citations are checked against the collected package; unknown IDs or invalid source paths/line ranges fail the investigation. Unsupported claims are labeled. Logs, test output, source, and attachments are explicitly treated as untrusted data in the system prompt and serialized as data. Common credential formats are redacted and evidence is bounded. Binary attachments such as `screenshot.png` are listed in a separate, budget-independent index containing the evidence/attachment ID, filename, media type, Azure DevOps test-result location, and link. Image pixels are not sent to the current text-only AI providers; the model is instructed to identify where to open the screenshot and not claim visual inspection. The investigator never executes commands or modifies Azure DevOps.
 
 After a provider responds, the complete model response text is logged and included in the investigation report and CLI output. Common credential patterns are redacted and terminal control characters are replaced before logging/display; the response remains untrusted model output. These logs and reports may contain diagnostic details, so keep them in an access-controlled location and do not enable less-restricted log forwarding.
 

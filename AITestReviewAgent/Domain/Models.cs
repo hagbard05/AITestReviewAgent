@@ -89,7 +89,8 @@ public sealed record EvidenceItem(
     string? Url = null,
     DateTimeOffset? Timestamp = null,
     string? Revision = null,
-    string? Error = null);
+    string? Error = null,
+    long? SizeBytes = null);
 
 public sealed record EvidenceReference(
     string EvidenceId,
@@ -192,7 +193,7 @@ public sealed record TestAttachment(
     long? Size,
     DateTimeOffset? Timestamp = null);
 
-public sealed record RepositoryCommit(string CommitId, DateTimeOffset? Timestamp);
+public sealed record RepositoryCommit(string CommitId, DateTimeOffset? Timestamp, string? TreeId = null);
 
 public sealed record ProviderResponse(string Content, string Model, long? InputTokens, long? OutputTokens);
 

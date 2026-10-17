@@ -7,6 +7,7 @@ using AITestReviewAgent.Domain;
 using AITestReviewAgent.Evidence;
 using AITestReviewAgent.Investigation;
 using AITestReviewAgent.Reports;
+using AITestReviewAgent.SourceControl;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -80,7 +81,10 @@ public class Program
                     Console.WriteLine(
                         $"This sends sanitized failure evidence and test source to {aiOptions.Provider}/{aiOptions.Model}.");
                     Console.Write("Authorize this model request?: (y) ");
-                    if (!string.Equals(Console.ReadKey().KeyChar.ToString().ToLower(), "y", StringComparison.Ordinal))
+                    var authorization = Console.IsInputRedirected
+                        ? Console.ReadLine()?.Trim()
+                        : Console.ReadKey().KeyChar.ToString();
+                    if (!string.Equals(authorization, "y", StringComparison.OrdinalIgnoreCase))
                     {
                         Console.WriteLine("Model request not authorised Investigation not submitted.");
                         return 0;
@@ -144,9 +148,16 @@ public class Program
 
         var azureOptions = AzureDevOpsOptions.From(builder.Configuration);
         var aiOptions = AiOptions.From(builder.Configuration);
+        var gitHubOptions = GitHubOptions.From(builder.Configuration);
         builder.Services.AddSingleton(azureOptions);
         builder.Services.AddSingleton(aiOptions);
+        builder.Services.AddSingleton(gitHubOptions);
         builder.Services.AddHttpClient<IAzureDevOpsClient, AzureDevOpsClient>();
+        builder.Services.AddTransient<AzureReposSourceClient>();
+        builder.Services.AddHttpClient<GitHubSourceClient>();
+        builder.Services.AddTransient<ISourceRepositoryClient, AzureReposSourceClient>();
+        builder.Services.AddTransient<ISourceRepositoryClient>(serviceProvider =>
+            serviceProvider.GetRequiredService<GitHubSourceClient>());
         if (aiOptions.Provider.Equals("gemini", StringComparison.OrdinalIgnoreCase))
         {
             builder.Services.AddHttpClient<ILLMProvider, GoogleGeminiProvider>();

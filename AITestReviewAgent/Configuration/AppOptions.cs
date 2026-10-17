@@ -113,7 +113,10 @@ public sealed record AiOptions(
                 : "AI:Endpoint must be HTTPS (HTTP is allowed only for localhost tests).");
         }
 
-        if (requireCredentials && string.IsNullOrWhiteSpace(ApiKey))
+        var usesLocalOpenAiCompatibleEndpoint = isOpenAiCompatible
+            && Uri.TryCreate(Endpoint, UriKind.Absolute, out var localEndpoint)
+            && localEndpoint.IsLoopback;
+        if (requireCredentials && !usesLocalOpenAiCompatibleEndpoint && string.IsNullOrWhiteSpace(ApiKey))
         {
             throw new ConfigurationException(
                 "AI API key is missing. Store it with 'dotnet user-secrets set \"AI:ApiKey\" \"<key>\"'.");

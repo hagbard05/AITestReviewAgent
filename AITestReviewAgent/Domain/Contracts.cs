@@ -45,7 +45,7 @@ public interface ISourceRepositoryClient
 
     Task<IReadOnlyList<RepositoryItem>> GetRepositoryItemsAsync(
         RepositoryInfo repository,
-        string commitId,
+        RepositoryCommit commit,
         CancellationToken cancellationToken);
 
     Task<string?> GetRepositoryFileAsync(

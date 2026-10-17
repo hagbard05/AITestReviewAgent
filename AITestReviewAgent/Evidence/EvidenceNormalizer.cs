@@ -62,7 +62,8 @@ public sealed class EvidenceNormalizer(int maxItemCharacters)
                 EvidenceSanitizer.Sanitize(attachment.Name),
                 EvidenceSanitizer.Sanitize(attachment.Url ?? string.Empty),
                 Timestamp: attachment.Timestamp,
-                Error: safeError);
+                Error: safeError,
+                SizeBytes: attachment.Size);
         }
 
         var limited = EvidenceSanitizer.Limit(content, maxItemCharacters, out var truncated);
@@ -74,7 +75,8 @@ public sealed class EvidenceNormalizer(int maxItemCharacters)
             limited,
             EvidenceSanitizer.Sanitize(attachment.Name),
             EvidenceSanitizer.Sanitize(attachment.Url ?? string.Empty),
-            Timestamp: attachment.Timestamp);
+            Timestamp: attachment.Timestamp,
+            SizeBytes: attachment.Size);
     }
 
     public EvidenceItem ForSource(
@@ -83,7 +85,8 @@ public sealed class EvidenceNormalizer(int maxItemCharacters)
         string commitId,
         string? url,
         out string numberedContent,
-        DateTimeOffset? timestamp = null)
+        DateTimeOffset? timestamp = null,
+        string providerName = "Azure Repos Git")
     {
         var id = $"source-{Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(path)))[..12].ToLowerInvariant()}";
         var lines = content.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
@@ -92,7 +95,7 @@ public sealed class EvidenceNormalizer(int maxItemCharacters)
         return new EvidenceItem(
             id,
             EvidenceType.SourceCode,
-            "Azure Repos file at build commit",
+            $"{providerName} file at build commit",
             truncated ? EvidenceCollectionStatus.Truncated : EvidenceCollectionStatus.Available,
             limited,
             Path: EvidenceSanitizer.Sanitize(path),
@@ -105,10 +108,11 @@ public sealed class EvidenceNormalizer(int maxItemCharacters)
         string commitId,
         string repositoryId,
         string repositoryName,
-        DateTimeOffset? timestamp = null) => new(
+        DateTimeOffset? timestamp = null,
+        string providerName = "Azure Repos Git") => new(
         "repository-commit",
         EvidenceType.RepositoryCommit,
-        "Azure Repos commit",
+        $"{providerName} commit",
         EvidenceCollectionStatus.Available,
         Limit($"Verified commit: {commitId}\nRepository ID: {repositoryId}\nRepository: {repositoryName}"),
         Timestamp: timestamp,
