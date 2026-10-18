@@ -173,6 +173,51 @@ public sealed class InvestigationTests
     }
 
     [Fact]
+    public async Task InvestigatorConservativelyHandlesMissingClaimKindAndReportsIt()
+    {
+        var context = CreateContext();
+        var response = BuildModelResponse(context);
+        const string observationKind = "\"kind\":\"Observation\"";
+        var kindIndex = response.IndexOf(observationKind, StringComparison.Ordinal);
+        Assert.True(kindIndex >= 0);
+        response = string.Concat(
+            response.AsSpan(0, kindIndex),
+            "\"kind\":\"\"",
+            response.AsSpan(kindIndex + observationKind.Length));
+        var fake = new FakeProvider(response);
+        var investigator = new AIInvestigator(fake, ValidAiOptions());
+
+        var result = await investigator.InvestigateAsync(
+            new InvestigationRequest(42, 7), context, CancellationToken.None);
+
+        Assert.Equal(InvestigationStatus.Completed, result.Status);
+        Assert.Equal(ClaimKind.Hypothesis, result.Reasoning[0].Kind);
+        Assert.Contains(result.Limitations, limitation =>
+            limitation.Contains("reasoning[0].kind", StringComparison.Ordinal)
+            && limitation.Contains("conservatively treated as Hypothesis", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task InvestigatorStillRejectsNonEmptyUnknownClaimKind()
+    {
+        var context = CreateContext();
+        var response = BuildModelResponse(context);
+        const string observationKind = "\"kind\":\"Observation\"";
+        var kindIndex = response.IndexOf(observationKind, StringComparison.Ordinal);
+        Assert.True(kindIndex >= 0);
+        response = string.Concat(
+            response.AsSpan(0, kindIndex),
+            "\"kind\":\"UnsupportedKind\"",
+            response.AsSpan(kindIndex + observationKind.Length));
+        var investigator = new AIInvestigator(new FakeProvider(response), ValidAiOptions());
+
+        var exception = await Assert.ThrowsAsync<InvestigationOutputException>(() =>
+            investigator.InvestigateAsync(new InvestigationRequest(42, 7), context, CancellationToken.None));
+
+        Assert.Contains("unknown claim kind 'UnsupportedKind'", exception.Message);
+    }
+
+    [Fact]
     public async Task InvestigatorReturnsPreliminaryWhenRelevantSourceExceedsPromptBudget()
     {
         var context = CreateContext();

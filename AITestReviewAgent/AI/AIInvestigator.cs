@@ -137,6 +137,7 @@ public sealed class AIInvestigator(
             throw new InvestigationOutputException("The AI confidence must be an integer from 0 to 100.");
         }
 
+        var outputWarnings = NormalizeMissingClaimKinds(output);
         RequireText(output.Summary, "summary");
         RequireText(output.RecommendedNextAction, "recommendedNextAction");
         if (output.Reasoning is null || output.Reasoning.Count == 0)
@@ -283,6 +284,7 @@ public sealed class AIInvestigator(
         }
 
         var limitations = SanitizeStrings(output.Limitations, "limitations").ToList();
+        limitations.AddRange(outputWarnings);
         limitations.Add("Confidence is a model estimate, not a statistically calibrated probability.");
         limitations.Add("No controlled reproduction runner is implemented; the plan was not executed.");
         limitations.Add("Only Azure DevOps failing-since metadata is used; historical test executions are not queried.");
@@ -410,6 +412,66 @@ public sealed class AIInvestigator(
 
             ValidateIds(claim.EvidenceIds, evidence);
             _ = ParseClaimKind(claim.Kind);
+        }
+    }
+
+    private static IReadOnlyList<string> NormalizeMissingClaimKinds(InvestigationOutput output)
+    {
+        var warnings = new List<string>();
+        NormalizeClaimKinds(output.Reasoning, "reasoning", warnings);
+        NormalizeClaimKinds(output.ContradictoryEvidence, "contradictoryEvidence", warnings);
+        NormalizeClaimKind(output.Reconstruction?.FirstKnownDivergence, "reconstruction.firstKnownDivergence", warnings);
+        NormalizeStepKinds(output.Reconstruction?.SetupAndTeardown, "reconstruction.setupAndTeardown", warnings);
+        NormalizeStepKinds(output.Reconstruction?.Actions, "reconstruction.actions", warnings);
+        NormalizeStepKinds(output.Reconstruction?.HelpersAndFixtures, "reconstruction.helpersAndFixtures", warnings);
+        NormalizeStepKinds(output.Reconstruction?.InputsAndConfiguration, "reconstruction.inputsAndConfiguration", warnings);
+        NormalizeStepKinds(output.Reconstruction?.ExpectedResultsAndAssertions, "reconstruction.expectedResultsAndAssertions", warnings);
+        return warnings;
+    }
+
+    private static void NormalizeClaimKinds(
+        IReadOnlyList<ClaimOutput>? claims,
+        string path,
+        ICollection<string> warnings)
+    {
+        if (claims is null)
+        {
+            return;
+        }
+
+        for (var index = 0; index < claims.Count; index++)
+        {
+            NormalizeClaimKind(claims[index], $"{path}[{index}]", warnings);
+        }
+    }
+
+    private static void NormalizeClaimKind(ClaimOutput? claim, string path, ICollection<string> warnings)
+    {
+        if (claim is not null && string.IsNullOrWhiteSpace(claim.Kind))
+        {
+            claim.Kind = nameof(ClaimKind.Hypothesis);
+            warnings.Add($"The AI omitted '{path}.kind'; it was conservatively treated as Hypothesis.");
+        }
+    }
+
+    private static void NormalizeStepKinds(
+        IReadOnlyList<ReconstructedStepOutput>? steps,
+        string path,
+        ICollection<string> warnings)
+    {
+        if (steps is null)
+        {
+            return;
+        }
+
+        for (var index = 0; index < steps.Count; index++)
+        {
+            var step = steps[index];
+            if (step is not null && string.IsNullOrWhiteSpace(step.Kind))
+            {
+                step.Kind = nameof(ClaimKind.Hypothesis);
+                warnings.Add($"The AI omitted '{path}[{index}].kind'; it was conservatively treated as Hypothesis.");
+            }
         }
     }
 

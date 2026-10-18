@@ -16,7 +16,7 @@ public static class InvestigationPrompt
         Cite evidence IDs for substantive claims. Only cite IDs present in the evidence package. Source reconstruction steps must cite source evidence with file paths and one-based line ranges.
         If required source code is missing or its exact revision is unverified, the application will not call you. If other evidence is insufficient, classify as Inconclusive.
         Confidence is a subjective estimate from 0 to 100, not a calibrated probability.
-        Return one JSON object, no markdown, with these fields:
+        Return one JSON object, no markdown, with these fields. Every claim and every reconstruction step must include a non-empty "kind" field using exactly one of the values shown; never omit it.
         {
           "classification":"ApplicationDefect|TestDefect|FlakyTest|EnvironmentFailure|DependencyFailure|Inconclusive",
           "summary":"...",
