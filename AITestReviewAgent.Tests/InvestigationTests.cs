@@ -28,6 +28,8 @@ public sealed class InvestigationTests
             public void FailsWhenBroken() { Assert.Equal(1, 2); }
         }
         """;
+    private static readonly byte[] ScreenshotBytes = Convert.FromBase64String(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/f1sAAAAASUVORK5CYII=");
 
     [Fact]
     public void FailureClassificationIncludesInconclusive()
@@ -104,7 +106,7 @@ public sealed class InvestigationTests
             attachmentInfo.GetProperty("url").GetString());
         Assert.False(attachmentInfo.GetProperty("imagePixelsIncluded").GetBoolean());
         Assert.Contains("not included", attachmentInfo.GetProperty("note").GetString(), StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("do not claim to have viewed", InvestigationPrompt.SystemPrompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("do not claim to have viewed", InvestigationPrompt.BuildSystemPrompt(false), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -314,6 +316,7 @@ public sealed class InvestigationTests
         };
         var geminiOptions = AiOptions.From(geminiConfig);
         Assert.Equal("https://generativelanguage.googleapis.com/v1beta", geminiOptions.Endpoint);
+        Assert.True(geminiOptions.SupportsImages);
         geminiOptions.Validate(requireCredentials: true);
         Assert.Throws<ConfigurationException>(() =>
             (geminiOptions with { Endpoint = "https://example.com/gemini?key=secret" })
@@ -376,6 +379,49 @@ public sealed class InvestigationTests
         Assert.Equal("{\"classification\":\"Inconclusive\"}", result.Content);
         Assert.Equal(12, result.InputTokens);
         Assert.Equal(8, result.OutputTokens);
+    }
+
+    [Fact]
+    public async Task OpenAiCompatibleProviderSendsImageAsDataUrlOnlyWhenImageSupportIsEnabled()
+    {
+        var options = ValidLocalAiOptions() with { SupportsImages = true };
+        var image = new ImageInput("attachment-19", "screenshot.png", "image/png", ScreenshotBytes);
+        var handler = new DelegateHandler((request, _) =>
+        {
+            using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+            var userContent = body.RootElement.GetProperty("messages")[1].GetProperty("content");
+            Assert.Equal(JsonValueKind.Array, userContent.ValueKind);
+            Assert.Equal("text", userContent[0].GetProperty("type").GetString());
+            Assert.Equal("image_url", userContent[1].GetProperty("type").GetString());
+            Assert.Equal(
+                "data:image/png;base64," + Convert.ToBase64String(ScreenshotBytes),
+                userContent[1].GetProperty("image_url").GetProperty("url").GetString());
+            return Response(HttpStatusCode.OK,
+                """{"choices":[{"message":{"content":"{}"}}]}""");
+        });
+        var provider = new OpenAiCompatibleProvider(new HttpClient(handler), options);
+
+        var response = await provider.CompleteAsync(
+            new LlmRequest("system", "inspect image", options.Model, 100, [image]),
+            CancellationToken.None);
+
+        Assert.Equal("{}", response.Content);
+    }
+
+    [Fact]
+    public async Task OpenAiCompatibleProviderRejectsImageWhenModelCapabilityIsDisabled()
+    {
+        var options = ValidLocalAiOptions();
+        var handler = new DelegateHandler((_, _) => Response(HttpStatusCode.OK, """{"choices":[]}"""));
+        var provider = new OpenAiCompatibleProvider(new HttpClient(handler), options);
+
+        var exception = await Assert.ThrowsAsync<LlmProviderException>(() => provider.CompleteAsync(
+            new LlmRequest("system", "inspect image", options.Model, 100,
+                [new ImageInput("attachment-19", "screenshot.png", "image/png", ScreenshotBytes)]),
+            CancellationToken.None));
+
+        Assert.Contains("not configured for image input", exception.Message);
+        Assert.Equal(0, handler.RequestCount);
     }
 
     [Fact]
@@ -518,6 +564,32 @@ public sealed class InvestigationTests
     }
 
     [Fact]
+    public async Task GoogleGeminiProviderSendsImageBytesAsInlineDataParts()
+    {
+        var options = ValidGeminiOptions();
+        var image = new ImageInput("attachment-20", "screenshot.png", "image/png", ScreenshotBytes);
+        var handler = new DelegateHandler((request, _) =>
+        {
+            using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+            var parts = body.RootElement.GetProperty("contents")[0].GetProperty("parts");
+            Assert.Equal("inspect screenshot", parts[0].GetProperty("text").GetString());
+            Assert.Equal("image/png", parts[1].GetProperty("inlineData").GetProperty("mimeType").GetString());
+            Assert.Equal(Convert.ToBase64String(ScreenshotBytes),
+                parts[1].GetProperty("inlineData").GetProperty("data").GetString());
+            return Response(HttpStatusCode.OK,
+                """{"candidates":[{"content":{"parts":[{"text":"{}"}]},"finishReason":"STOP"}]}""");
+        });
+        var provider = new GoogleGeminiProvider(new HttpClient(handler), options);
+
+        var response = await provider.CompleteAsync(
+            new LlmRequest("system", "inspect screenshot", options.Model, 200, [image]),
+            CancellationToken.None);
+
+        Assert.True(provider.SupportsImages);
+        Assert.Equal("{}", response.Content);
+    }
+
+    [Fact]
     public async Task GoogleGeminiProviderRetriesRateLimitsWithoutExposingKey()
     {
         var handler = new DelegateHandler((request, attempt) =>
@@ -589,8 +661,42 @@ public sealed class InvestigationTests
         Assert.Contains("dependency timed out", fakeProvider.LastRequest!.UserPrompt);
         Assert.Contains("prior-build", fakeProvider.LastRequest.UserPrompt);
         Assert.Contains(handler.Requests, request => request.EndsWith("/attachments/19?api-version=7.1", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Requests, request => request.EndsWith("/attachments/20?api-version=7.1", StringComparison.Ordinal));
         Assert.Contains(handler.Requests, request => request.Contains("/commits/" + CommitId, StringComparison.Ordinal));
         Assert.Contains(handler.Requests, request => request.Contains("versionDescriptor.version=" + CommitId, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task InvestigationRetrievesAndSendsScreenshotOnlyForVisionCapableProvider()
+    {
+        var handler = new SyntheticAzureHandler();
+        var azure = new AzureDevOpsClient(new HttpClient(handler), ValidAzureOptions());
+        var fakeProvider = new FakeProvider(BuildModelResponse(CreateContext())) { SupportsImages = true };
+        var normalizer = new EvidenceNormalizer(30_000);
+        var workflow = new InvestigationOrchestrator(
+            azure,
+            new TestSourceCollector([new AzureReposSourceClient(azure, ValidAzureOptions())], ValidAzureOptions(), normalizer),
+            new AIInvestigator(fakeProvider, ValidAiOptions()),
+            ValidAzureOptions());
+
+        var result = await workflow.InvestigateAsync(
+            new InvestigationRequest(42, 7, 9), CancellationToken.None);
+
+        Assert.Equal(InvestigationStatus.Completed, result.Status);
+        var image = Assert.Single(fakeProvider.LastRequest!.Images!);
+        Assert.Equal("attachment-20", image.EvidenceId);
+        Assert.Equal("screenshot.png", image.FileName);
+        Assert.Equal("image/png", image.MediaType);
+        Assert.Equal(ScreenshotBytes, image.Content);
+        Assert.Contains(handler.Requests, request => request.EndsWith("/attachments/20?api-version=7.1", StringComparison.Ordinal));
+        using var prompt = JsonDocument.Parse(fakeProvider.LastRequest.UserPrompt);
+        var screenshot = prompt.RootElement.GetProperty("attachments")
+            .EnumerateArray()
+            .Single(item => item.GetProperty("evidenceId").GetString() == "attachment-20");
+        Assert.True(screenshot.GetProperty("imagePixelsIncluded").GetBoolean());
+        Assert.Equal(0, screenshot.GetProperty("imageInputIndex").GetInt32());
+        Assert.Contains("Analyze each supplied screenshot", fakeProvider.LastRequest.SystemPrompt);
+        Assert.DoesNotContain(Convert.ToBase64String(ScreenshotBytes), fakeProvider.LastRequest.UserPrompt);
     }
 
     [Fact]
@@ -885,7 +991,7 @@ public sealed class InvestigationTests
 
     private static AiOptions ValidGeminiOptions() =>
         new("gemini", "gemini-2.5-flash", "https://generativelanguage.googleapis.com/v1beta",
-            "provider-secret", 90, 5000, 50_000, 0);
+            "provider-secret", 90, 5000, 50_000, 0, true);
 
     private static string BuildJson() => JsonSerializer.Serialize(new
     {
@@ -910,6 +1016,8 @@ public sealed class InvestigationTests
         private readonly string _content;
 
         public FakeProvider(string content) => _content = content;
+
+        public bool SupportsImages { get; init; }
 
         public int CallCount { get; private set; }
         public LlmRequest? LastRequest { get; private set; }
@@ -986,12 +1094,20 @@ public sealed class InvestigationTests
             if (path.EndsWith("/test/Runs/9/Results/7/attachments", StringComparison.OrdinalIgnoreCase))
             {
                 return Task.FromResult(Response(HttpStatusCode.OK,
-                    """{"count":1,"value":[{"id":19,"fileName":"diagnostics.log","url":"https://dev.azure.com/org/attachment/19","size":22,"createdDate":"2026-10-11T10:00:00Z"}]}"""));
+                    """{"count":2,"value":[{"id":19,"fileName":"diagnostics.log","url":"https://dev.azure.com/org/attachment/19","size":22,"createdDate":"2026-10-11T10:00:00Z"},{"id":20,"fileName":"screenshot.png","url":"https://dev.azure.com/org/attachment/20","size":68,"createdDate":"2026-10-11T10:00:01Z"}]}"""));
             }
 
             if (path.EndsWith("/test/Runs/9/Results/7/attachments/19", StringComparison.OrdinalIgnoreCase))
             {
                 return Task.FromResult(Response(HttpStatusCode.OK, "dependency timed out", "text/plain"));
+            }
+
+            if (path.EndsWith("/test/Runs/9/Results/7/attachments/20", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(ScreenshotBytes)
+                });
             }
 
             if (path.Contains("/commits/", StringComparison.Ordinal))

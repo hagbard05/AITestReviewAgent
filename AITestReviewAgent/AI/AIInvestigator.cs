@@ -13,6 +13,8 @@ public sealed class AIInvestigator(
     AiOptions options,
     ILogger<AIInvestigator>? logger = null) : IAIInvestigator
 {
+    public bool SupportsImages => provider.SupportsImages;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -68,9 +70,15 @@ public sealed class AIInvestigator(
                     : omittedSource.Select(path => $"Source file '{path}' was truncated or unavailable."));
         }
 
-        var prompt = InvestigationPrompt.BuildUserPrompt(context, options.MaxEvidenceCharacters);
+        var images = context.Images ?? Array.Empty<ImageInput>();
+        var prompt = InvestigationPrompt.BuildUserPrompt(context, options.MaxEvidenceCharacters, images);
         var response = await provider.CompleteAsync(
-            new LlmRequest(InvestigationPrompt.SystemPrompt, prompt, options.Model, options.MaxOutputTokens),
+            new LlmRequest(
+                InvestigationPrompt.BuildSystemPrompt(images.Count > 0),
+                prompt,
+                options.Model,
+                options.MaxOutputTokens,
+                images),
             cancellationToken);
         var sanitizedResponse = EvidenceSanitizer.SanitizeModelOutput(response.Content);
         logger?.LogInformation(

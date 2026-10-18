@@ -33,15 +33,30 @@ public sealed class OpenAiCompatibleProvider : ILLMProvider
         }
     }
 
+    public bool SupportsImages => _options.SupportsImages;
+
     public async Task<ProviderResponse> CompleteAsync(LlmRequest request, CancellationToken cancellationToken)
     {
+        var images = request.Images ?? Array.Empty<ImageInput>();
+        if (images.Count > 0 && !SupportsImages)
+        {
+            throw new LlmProviderException(
+                "Image evidence was supplied to an OpenAI-compatible model that is not configured for image input.");
+        }
+
         var body = JsonSerializer.Serialize(new
         {
             model = request.Model,
-            messages = new[]
+            messages = new object[]
             {
                 new { role = "system", content = request.SystemPrompt },
-                new { role = "user", content = request.UserPrompt }
+                new
+                {
+                    role = "user",
+                    content = images.Count == 0
+                        ? (object)request.UserPrompt
+                        : CreateMultimodalUserContent(request.UserPrompt, images)
+                }
             },
             response_format = new { type = "text" },
             max_tokens = request.MaxOutputTokens,
@@ -59,6 +74,7 @@ public sealed class OpenAiCompatibleProvider : ILLMProvider
                 },
                 cancellationToken);
         }
+
         catch (HttpRequestException)
         {
             throw new LlmProviderException("The configured AI provider could not be reached.");
@@ -125,6 +141,20 @@ public sealed class OpenAiCompatibleProvider : ILLMProvider
                 throw new LlmProviderException("The AI provider returned unexpected chat completion fields.");
             }
         }
+    }
+
+    private static object[] CreateMultimodalUserContent(string prompt, IReadOnlyList<ImageInput> images)
+    {
+        var content = new List<object> { new { type = "text", text = prompt } };
+        content.AddRange(images.Select(image => (object)new
+        {
+            type = "image_url",
+            image_url = new
+            {
+                url = $"data:{image.MediaType};base64,{Convert.ToBase64String(image.Content)}"
+            }
+        }));
+        return content.ToArray();
     }
 
     private static async Task<string> ReadResponseAsync(

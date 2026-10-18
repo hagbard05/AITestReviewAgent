@@ -60,11 +60,15 @@ public interface ISourceRepositoryClient
 
 public interface ILLMProvider
 {
+    bool SupportsImages { get; }
+
     Task<ProviderResponse> CompleteAsync(LlmRequest request, CancellationToken cancellationToken);
 }
 
 public interface IAIInvestigator
 {
+    bool SupportsImages { get; }
+
     Task<InvestigationResult> InvestigateAsync(
         InvestigationRequest request,
         InvestigationContext context,

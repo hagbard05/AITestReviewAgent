@@ -177,7 +177,8 @@ public sealed record InvestigationContext(
     TestCaseResult TestResult,
     TestSourceSnapshot Source,
     IReadOnlyList<EvidenceItem> Evidence,
-    IReadOnlyList<string> CollectionErrors);
+    IReadOnlyList<string> CollectionErrors,
+    IReadOnlyList<ImageInput>? Images = null);
 
 public sealed record RepositoryItem(
     string Path,
@@ -197,4 +198,11 @@ public sealed record RepositoryCommit(string CommitId, DateTimeOffset? Timestamp
 
 public sealed record ProviderResponse(string Content, string Model, long? InputTokens, long? OutputTokens);
 
-public sealed record LlmRequest(string SystemPrompt, string UserPrompt, string Model, int MaxOutputTokens);
+public sealed record ImageInput(string EvidenceId, string FileName, string MediaType, byte[] Content);
+
+public sealed record LlmRequest(
+    string SystemPrompt,
+    string UserPrompt,
+    string Model,
+    int MaxOutputTokens,
+    IReadOnlyList<ImageInput>? Images = null);

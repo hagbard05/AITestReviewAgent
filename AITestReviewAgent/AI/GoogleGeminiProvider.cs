@@ -23,6 +23,8 @@ public sealed class GoogleGeminiProvider : ILLMProvider
         _httpClient.Timeout = TimeSpan.FromSeconds(_options.TimeoutSeconds);
     }
 
+    public bool SupportsImages => _options.SupportsImages;
+
     public async Task<ProviderResponse> CompleteAsync(
         LlmRequest request,
         CancellationToken cancellationToken)
@@ -38,7 +40,7 @@ public sealed class GoogleGeminiProvider : ILLMProvider
                 new
                 {
                     role = "user",
-                    parts = new[] { new { text = request.UserPrompt } }
+                    parts = CreateUserParts(request)
                 }
             },
             generationConfig = new
@@ -47,6 +49,7 @@ public sealed class GoogleGeminiProvider : ILLMProvider
                 maxOutputTokens = request.MaxOutputTokens,
                 temperature = _options.Temperature
             }
+
         });
         var uri = new Uri(
             _endpoint,
@@ -150,6 +153,24 @@ public sealed class GoogleGeminiProvider : ILLMProvider
                 throw new LlmProviderException("Google Gemini returned unexpected generateContent response fields.");
             }
         }
+    }
+
+    private static object[] CreateUserParts(LlmRequest request)
+    {
+        var parts = new List<object> { new { text = request.UserPrompt } };
+        foreach (var image in request.Images ?? Array.Empty<ImageInput>())
+        {
+            parts.Add(new
+            {
+                inlineData = new
+                {
+                    mimeType = image.MediaType,
+                    data = Convert.ToBase64String(image.Content)
+                }
+            });
+        }
+
+        return parts.ToArray();
     }
 
     private static async Task<string> ReadResponseAsync(

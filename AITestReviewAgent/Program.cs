@@ -78,8 +78,11 @@ public class Program
                             $"Report file '{outputPath}' already exists; choose a different output path.");
                     }
 
+                    var imageDisclosure = aiOptions.SupportsImages
+                        ? " Supported screenshot attachments may be sent as image data."
+                        : " Screenshot image pixels are not sent.";
                     Console.WriteLine(
-                        $"This sends sanitized failure evidence and test source to {aiOptions.Provider}/{aiOptions.Model}.");
+                        $"This sends sanitized failure evidence and test source to {aiOptions.Provider}/{aiOptions.Model}.{imageDisclosure}");
                     Console.Write("Authorize this model request?: (y) ");
                     var authorization = Console.IsInputRedirected
                         ? Console.ReadLine()?.Trim()

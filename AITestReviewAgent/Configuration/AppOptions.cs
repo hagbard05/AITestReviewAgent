@@ -68,7 +68,8 @@ public sealed record AiOptions(
     int TimeoutSeconds,
     int MaxOutputTokens,
     int MaxEvidenceCharacters,
-    double Temperature)
+    double Temperature,
+    bool SupportsImages = false)
 {
     public static AiOptions From(IConfiguration configuration)
     {
@@ -84,7 +85,11 @@ public sealed record AiOptions(
             ReadInt(configuration["AI:TimeoutSeconds"], "AI:TimeoutSeconds", 90),
             ReadInt(configuration["AI:MaxOutputTokens"], "AI:MaxOutputTokens", 5000),
             ReadInt(configuration["AI:MaxEvidenceCharacters"], "AI:MaxEvidenceCharacters", 50_000),
-            ReadDouble(configuration, "AI:Temperature", 0));
+            ReadDouble(configuration, "AI:Temperature", 0),
+            ReadBool(
+                configuration["AI:SupportsImages"],
+                "AI:SupportsImages",
+                provider.Equals("gemini", StringComparison.OrdinalIgnoreCase)));
     }
 
     public void Validate(bool requireCredentials)
@@ -156,6 +161,18 @@ public sealed record AiOptions(
         return double.TryParse(setting, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
             ? value
             : throw new ConfigurationException($"{key} must be a number.");
+    }
+
+    private static bool ReadBool(string? setting, string key, bool fallback)
+    {
+        if (setting is null)
+        {
+            return fallback;
+        }
+
+        return bool.TryParse(setting, out var value)
+            ? value
+            : throw new ConfigurationException($"{key} must be true or false.");
     }
 }
 
