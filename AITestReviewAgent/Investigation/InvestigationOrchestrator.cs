@@ -15,6 +15,8 @@ public sealed class InvestigationOrchestrator(
 {
     private const int MaxAttachmentCount = 20;
     private const int MaxAttachmentBytes = 200_000;
+    private const int MaxPageSourceBytes = 500_000;
+    private const int MaxPageSourceCharacters = 15_000;
     private const int MaxImageAttachmentBytes = 4_000_000;
     private const int MaxTotalImageBytes = 8_000_000;
     private const int MaxImageCount = 4;
@@ -28,7 +30,7 @@ public sealed class InvestigationOrchestrator(
     };
     private static readonly HashSet<string> TextAttachmentExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".txt", ".log", ".trx", ".xml", ".json", ".csv", ".md", ".out", ".err"
+        ".txt", ".log", ".trx", ".xml", ".json", ".csv", ".md", ".out", ".err", ".html", ".htm"
     };
 
     public async Task<InvestigationResult> InvestigateAsync(
@@ -244,10 +246,12 @@ public sealed class InvestigationOrchestrator(
                 continue;
             }
 
+            var isPageSource = IsPageSource(attachment.Name);
+            var maxBytes = isPageSource ? MaxPageSourceBytes : MaxAttachmentBytes;
             try
             {
                 var bytes = await azureDevOps.GetTestAttachmentContentAsync(
-                    test.RunId, test.Id, attachment.Id, MaxAttachmentBytes, cancellationToken);
+                    test.RunId, test.Id, attachment.Id, maxBytes, cancellationToken);
                 if (bytes is null)
                 {
                     var message = EvidenceSanitizer.Sanitize($"Attachment '{attachment.Name}' is no longer available.");
@@ -256,16 +260,41 @@ public sealed class InvestigationOrchestrator(
                     continue;
                 }
 
-                var wasTruncated = bytes.Length > MaxAttachmentBytes;
-                var text = Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, MaxAttachmentBytes));
-                var item = normalizer.ForAttachment(attachment, text);
-                evidence.Add(wasTruncated
-                    ? item with
+                var wasTruncated = bytes.Length > maxBytes
+                    || attachment.Size is long declaredSize && declaredSize > maxBytes;
+                var text = Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, maxBytes));
+                if (isPageSource)
+                {
+                    var normalized = PageSourceNormalizer.Normalize(
+                        text, MaxPageSourceCharacters, out var normalizationTruncated);
+                    var item = normalizer.ForAttachment(attachment, normalized) with
                     {
-                        Status = EvidenceCollectionStatus.Truncated,
-                        Content = item.Content + "\n[Attachment content truncated by size limit.]"
-                    }
-                    : item);
+                        Source = "Azure DevOps HTML page source attachment"
+                    };
+                    evidence.Add(wasTruncated || normalizationTruncated
+                        ? item with
+                        {
+                            Status = EvidenceCollectionStatus.Truncated
+                        }
+                        : item);
+                }
+                else
+                {
+                    var item = normalizer.ForAttachment(attachment, text);
+                    evidence.Add(wasTruncated
+                        ? item with
+                        {
+                            Status = EvidenceCollectionStatus.Truncated,
+                            Content = item.Content + "\n[Attachment content truncated by size limit.]"
+                        }
+                        : item);
+                }
+            }
+            catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+            {
+                var message = $"Page source attachment '{attachment.Name}' could not be normalized within the processing limit.";
+                errors.Add(message);
+                evidence.Add(normalizer.ForAttachment(attachment, null, message));
             }
             catch (AzureDevOpsException exception)
             {
@@ -278,6 +307,10 @@ public sealed class InvestigationOrchestrator(
 
         return images;
     }
+
+    private static bool IsPageSource(string name) =>
+        Path.GetExtension(name).Equals(".html", StringComparison.OrdinalIgnoreCase)
+        || Path.GetExtension(name).Equals(".htm", StringComparison.OrdinalIgnoreCase);
 
     private static bool HasExpectedImageSignature(byte[] bytes, string mediaType) => mediaType switch
     {

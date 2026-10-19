@@ -28,6 +28,13 @@ public sealed class InvestigationTests
             public void FailsWhenBroken() { Assert.Equal(1, 2); }
         }
         """;
+    private const string PageSource = """
+        <!doctype html>
+        <html><head><title>Payment confirmation</title><style>.hidden { display: none; }</style>
+        <script>window.secretScriptMustNotBeIncluded = true; const fake = '<a href="/script-link">not page text</a>';</script></head>
+        <body><main id="confirmation" class="page success"><h1>Payment received</h1>
+        <p>Your order is being processed.</p><a href="/orders/123">View order</a></main></body></html>
+        """;
     private static readonly byte[] ScreenshotBytes = Convert.FromBase64String(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/f1sAAAAASUVORK5CYII=");
 
@@ -126,6 +133,58 @@ public sealed class InvestigationTests
         var prompt = InvestigationPrompt.BuildUserPrompt(expanded, 1000);
 
         Assert.Contains("FailsWhenBroken", prompt);
+        Assert.Contains("\"wasTruncated\": true", prompt);
+    }
+
+    [Fact]
+    public void PageSourceNormalizerExtractsUsefulUntrustedPageTextWithoutScriptsOrStyles()
+    {
+        var normalized = PageSourceNormalizer.Normalize(PageSource, 15_000, out var truncated);
+
+        Assert.False(truncated);
+        Assert.Contains("Title: Payment confirmation", normalized);
+        Assert.Contains("Payment received", normalized);
+        Assert.Contains("View order -> /orders/123", normalized);
+        Assert.Contains("id=confirmation", normalized);
+        Assert.Contains("class=page success", normalized);
+        Assert.DoesNotContain("secretScriptMustNotBeIncluded", normalized);
+        Assert.DoesNotContain("/script-link", normalized);
+        Assert.DoesNotContain("display: none", normalized);
+    }
+
+    [Fact]
+    public void PageSourceNormalizerReportsAndEnforcesCharacterLimit()
+    {
+        var normalized = PageSourceNormalizer.Normalize(PageSource, 128, out var truncated);
+
+        Assert.True(truncated);
+        Assert.Equal(128, normalized.Length);
+    }
+
+    [Fact]
+    public void PromptPrioritizesPageSourceAfterTheFailedTestSource()
+    {
+        var context = CreateContext();
+        var pageSource = new EvidenceItem(
+            "attachment-21",
+            EvidenceType.Attachment,
+            "Azure DevOps HTML page source attachment",
+            EvidenceCollectionStatus.Available,
+            "Normalized page source: critical page state visible to the test.",
+            Path: "page-source.html");
+        var largeHelper = new EvidenceItem(
+            "helper-source",
+            EvidenceType.SourceCode,
+            "helper source",
+            EvidenceCollectionStatus.Available,
+            new string('x', 2000),
+            Path: "/Tests/Helper.cs");
+        context = context with { Evidence = context.Evidence.Append(largeHelper).Append(pageSource).ToArray() };
+
+        var prompt = InvestigationPrompt.BuildUserPrompt(context, 1000);
+
+        Assert.Contains("critical page state visible to the test", prompt);
+        Assert.Contains("attachment-21", prompt);
         Assert.Contains("\"wasTruncated\": true", prompt);
     }
 
@@ -705,8 +764,13 @@ public sealed class InvestigationTests
         Assert.Contains(result.MissingEvidence, item => item.Contains("Product behavior", StringComparison.Ordinal));
         Assert.Contains("dependency timed out", fakeProvider.LastRequest!.UserPrompt);
         Assert.Contains("prior-build", fakeProvider.LastRequest.UserPrompt);
+        Assert.Contains("Payment confirmation", fakeProvider.LastRequest.UserPrompt);
+        Assert.Contains("Payment received", fakeProvider.LastRequest.UserPrompt);
+        Assert.Contains("\"pageSourceTextIncluded\": true", fakeProvider.LastRequest.UserPrompt);
+        Assert.DoesNotContain("secretScriptMustNotBeIncluded", fakeProvider.LastRequest.UserPrompt);
         Assert.Contains(handler.Requests, request => request.EndsWith("/attachments/19?api-version=7.1", StringComparison.Ordinal));
         Assert.DoesNotContain(handler.Requests, request => request.EndsWith("/attachments/20?api-version=7.1", StringComparison.Ordinal));
+        Assert.Contains(handler.Requests, request => request.EndsWith("/attachments/21?api-version=7.1", StringComparison.Ordinal));
         Assert.Contains(handler.Requests, request => request.Contains("/commits/" + CommitId, StringComparison.Ordinal));
         Assert.Contains(handler.Requests, request => request.Contains("versionDescriptor.version=" + CommitId, StringComparison.Ordinal));
     }
@@ -1139,7 +1203,7 @@ public sealed class InvestigationTests
             if (path.EndsWith("/test/Runs/9/Results/7/attachments", StringComparison.OrdinalIgnoreCase))
             {
                 return Task.FromResult(Response(HttpStatusCode.OK,
-                    """{"count":2,"value":[{"id":19,"fileName":"diagnostics.log","url":"https://dev.azure.com/org/attachment/19","size":22,"createdDate":"2026-10-11T10:00:00Z"},{"id":20,"fileName":"screenshot.png","url":"https://dev.azure.com/org/attachment/20","size":68,"createdDate":"2026-10-11T10:00:01Z"}]}"""));
+                    """{"count":3,"value":[{"id":19,"fileName":"diagnostics.log","url":"https://dev.azure.com/org/attachment/19","size":22,"createdDate":"2026-10-11T10:00:00Z"},{"id":20,"fileName":"screenshot.png","url":"https://dev.azure.com/org/attachment/20","size":68,"createdDate":"2026-10-11T10:00:01Z"},{"id":21,"fileName":"page-source.html","url":"https://dev.azure.com/org/attachment/21","size":300,"createdDate":"2026-10-11T10:00:02Z"}]}"""));
             }
 
             if (path.EndsWith("/test/Runs/9/Results/7/attachments/19", StringComparison.OrdinalIgnoreCase))
@@ -1153,6 +1217,11 @@ public sealed class InvestigationTests
                 {
                     Content = new ByteArrayContent(ScreenshotBytes)
                 });
+            }
+
+            if (path.EndsWith("/test/Runs/9/Results/7/attachments/21", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(Response(HttpStatusCode.OK, PageSource, "text/html"));
             }
 
             if (path.Contains("/commits/", StringComparison.Ordinal))
