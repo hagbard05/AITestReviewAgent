@@ -30,10 +30,32 @@ public sealed class InvestigationTests
         """;
     private const string PageSource = """
         <!doctype html>
-        <html><head><title>Payment confirmation</title><style>.hidden { display: none; }</style>
-        <script>window.secretScriptMustNotBeIncluded = true; const fake = '<a href="/script-link">not page text</a>';</script></head>
+        <html><head><title>Payment confirmation</title><style>.hidden, #receipt { display: none; color: red; }</style>
+        <script>window.debugPageState = { ready: true }; const fake = '<a href="/script-link">not page text</a>';</script>
+        <script src="/scripts/checkout.js"></script><link rel="stylesheet" href="/styles/checkout.css"></head>
         <body><main id="confirmation" class="page success"><h1>Payment received</h1>
         <p>Your order is being processed.</p><a href="/orders/123">View order</a></main></body></html>
+        """;
+    private const string MhtmlPageSource = """
+        MIME-Version: 1.0
+        Content-Type: multipart/related; boundary="----=_MHTML_BOUNDARY"; type="text/html"
+
+        ------=_MHTML_BOUNDARY
+        Content-Type: text/html; charset="utf-8"
+        Content-Transfer-Encoding: quoted-printable
+        Content-Location: https://example.test/page
+
+        <!doctype html><html><head><title>MHTML confirmation</title></head>
+        <body><main id="mhtml-content"><h1>Rendered page text</h1>
+        <img src="cid:embedded-image" alt="embedded-image-alt-must-not-be-included">
+        <p>Encoded equals sign: 2 + 2 =3D 4</p></main></body></html>
+        ------=_MHTML_BOUNDARY
+        Content-Type: image/png
+        Content-Transfer-Encoding: base64
+        Content-ID: <embedded-image>
+
+        bWFya2VyLWltYWdlLXBheWxvYWQtZG9lcy1ub3QtYmVsb25nLWluLXByb21wdA==
+        ------=_MHTML_BOUNDARY--
         """;
     private static readonly byte[] ScreenshotBytes = Convert.FromBase64String(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/f1sAAAAASUVORK5CYII=");
@@ -137,7 +159,7 @@ public sealed class InvestigationTests
     }
 
     [Fact]
-    public void PageSourceNormalizerExtractsUsefulUntrustedPageTextWithoutScriptsOrStyles()
+    public void PageSourceNormalizerIncludesBoundedScriptAndSelectorEvidenceWithoutExecutingIt()
     {
         var normalized = PageSourceNormalizer.Normalize(PageSource, 15_000, out var truncated);
 
@@ -147,9 +169,31 @@ public sealed class InvestigationTests
         Assert.Contains("View order -> /orders/123", normalized);
         Assert.Contains("id=confirmation", normalized);
         Assert.Contains("class=page success", normalized);
-        Assert.DoesNotContain("secretScriptMustNotBeIncluded", normalized);
-        Assert.DoesNotContain("/script-link", normalized);
-        Assert.DoesNotContain("display: none", normalized);
+        Assert.Contains("window.debugPageState = { ready: true }", normalized);
+        Assert.Contains(".hidden, #receipt { display: none; color: red; }", normalized);
+        Assert.Contains("script src=/scripts/checkout.js", normalized);
+        Assert.Contains("stylesheet href=/styles/checkout.css", normalized);
+        var linksStart = normalized.IndexOf("Links:", StringComparison.Ordinal) + "Links:".Length;
+        var scriptsStart = normalized.IndexOf("Inline JavaScript", linksStart, StringComparison.Ordinal);
+        var linksSection = normalized[linksStart..scriptsStart];
+        Assert.DoesNotContain("/script-link", linksSection);
+        Assert.Contains("const fake = '<a href=\"/script-link\">", normalized);
+    }
+
+    [Fact]
+    public void PageSourceNormalizerBoundsInlineJavaScriptAndCssEvidence()
+    {
+        var html = "<script>" + new string('j', 6000) + "</script><style>"
+            + string.Join(string.Empty, Enumerable.Range(0, 50).Select(index => $".s{index} {{ color: red; }}"))
+            + "</style>";
+
+        var normalized = PageSourceNormalizer.Normalize(html, 15_000, out var truncated);
+
+        Assert.False(truncated);
+        Assert.True(normalized.Length < 15_000);
+        Assert.Contains("[Script content truncated.]", normalized);
+        Assert.Contains("[Additional CSS rules omitted after the configured limit.]", normalized);
+        Assert.DoesNotContain(new string('j', 5_001), normalized);
     }
 
     [Fact]
@@ -162,13 +206,51 @@ public sealed class InvestigationTests
     }
 
     [Fact]
+    public void PageSourceNormalizerExtractsMhtmlHtmlAndOmitsEmbeddedImages()
+    {
+        var normalized = PageSourceNormalizer.NormalizeMhtml(
+            Encoding.UTF8.GetBytes(MhtmlPageSource), 15_000, out var truncated);
+
+        Assert.False(truncated);
+        Assert.Contains("Title: MHTML confirmation", normalized);
+        Assert.Contains("Rendered page text", normalized);
+        Assert.Contains("2 + 2 = 4", normalized);
+        Assert.Contains("id=mhtml-content", normalized);
+        Assert.Contains("Inline JavaScript (untrusted source; not executed)", normalized);
+        Assert.Contains("(no inline scripts extracted)", normalized);
+        Assert.DoesNotContain("image/png", normalized);
+        Assert.DoesNotContain("embedded-image", normalized);
+        Assert.DoesNotContain("marker-image-payload", normalized);
+    }
+
+    [Fact]
+    public void PageSourceNormalizerRejectsMhtmlWithoutHtmlPart()
+    {
+        const string invalidMhtml = """
+            MIME-Version: 1.0
+            Content-Type: multipart/related; boundary="parts"
+
+            --parts
+            Content-Type: image/png
+
+            ignored
+            --parts--
+            """;
+
+        var exception = Assert.Throws<InvalidDataException>(() =>
+            PageSourceNormalizer.NormalizeMhtml(Encoding.UTF8.GetBytes(invalidMhtml), 1000, out _));
+
+        Assert.Contains("no text/html page part", exception.Message);
+    }
+
+    [Fact]
     public void PromptPrioritizesPageSourceAfterTheFailedTestSource()
     {
         var context = CreateContext();
         var pageSource = new EvidenceItem(
             "attachment-21",
             EvidenceType.Attachment,
-            "Azure DevOps HTML page source attachment",
+            "Azure DevOps page source attachment",
             EvidenceCollectionStatus.Available,
             "Normalized page source: critical page state visible to the test.",
             Path: "page-source.html");
@@ -438,6 +520,27 @@ public sealed class InvestigationTests
         Assert.Equal("qwen3-1.7b@q8_0", lmStudioOptions.Model);
         Assert.Equal("http://localhost:1234/v1/chat/completions", lmStudioOptions.Endpoint);
         lmStudioOptions.Validate(requireCredentials: true);
+    }
+
+    [Fact]
+    public async Task AzureClientGetsLatestBuildWithoutFilteringBuildResult()
+    {
+        var handler = new DelegateHandler((request, _) =>
+        {
+            Assert.Contains("queryOrder=finishTimeDescending", request.RequestUri!.Query);
+            Assert.Contains("$top=1", request.RequestUri.Query);
+            Assert.DoesNotContain("resultFilter", request.RequestUri.Query);
+            return Response(HttpStatusCode.OK,
+                """{"value":[{"id":52,"buildNumber":"latest build","status":"completed","result":"succeeded","finishTime":"2026-10-22T10:00:00Z"}]}""");
+        });
+        var client = new AzureDevOpsClient(new HttpClient(handler), ValidAzureOptions());
+
+        var build = await client.GetLatestBuildAsync(CancellationToken.None);
+
+        Assert.NotNull(build);
+        Assert.Equal(52, build.Id);
+        Assert.Equal("succeeded", build.Result);
+        Assert.Equal(1, handler.RequestCount);
     }
 
     [Fact]
@@ -766,11 +869,18 @@ public sealed class InvestigationTests
         Assert.Contains("prior-build", fakeProvider.LastRequest.UserPrompt);
         Assert.Contains("Payment confirmation", fakeProvider.LastRequest.UserPrompt);
         Assert.Contains("Payment received", fakeProvider.LastRequest.UserPrompt);
+        Assert.Contains("MHTML confirmation", fakeProvider.LastRequest.UserPrompt);
+        Assert.Contains("Rendered page text", fakeProvider.LastRequest.UserPrompt);
         Assert.Contains("\"pageSourceTextIncluded\": true", fakeProvider.LastRequest.UserPrompt);
-        Assert.DoesNotContain("secretScriptMustNotBeIncluded", fakeProvider.LastRequest.UserPrompt);
+        Assert.Contains("window.debugPageState = { ready: true }", fakeProvider.LastRequest.UserPrompt);
+        Assert.Contains(".hidden, #receipt { display: none; color: red; }", fakeProvider.LastRequest.UserPrompt);
+        Assert.Contains("/scripts/checkout.js", fakeProvider.LastRequest.UserPrompt);
+        Assert.DoesNotContain("embedded-image-alt-must-not-be-included", fakeProvider.LastRequest.UserPrompt);
+        Assert.DoesNotContain("marker-image-payload", fakeProvider.LastRequest.UserPrompt);
         Assert.Contains(handler.Requests, request => request.EndsWith("/attachments/19?api-version=7.1", StringComparison.Ordinal));
         Assert.DoesNotContain(handler.Requests, request => request.EndsWith("/attachments/20?api-version=7.1", StringComparison.Ordinal));
         Assert.Contains(handler.Requests, request => request.EndsWith("/attachments/21?api-version=7.1", StringComparison.Ordinal));
+        Assert.Contains(handler.Requests, request => request.EndsWith("/attachments/22?api-version=7.1", StringComparison.Ordinal));
         Assert.Contains(handler.Requests, request => request.Contains("/commits/" + CommitId, StringComparison.Ordinal));
         Assert.Contains(handler.Requests, request => request.Contains("versionDescriptor.version=" + CommitId, StringComparison.Ordinal));
     }
@@ -1203,7 +1313,7 @@ public sealed class InvestigationTests
             if (path.EndsWith("/test/Runs/9/Results/7/attachments", StringComparison.OrdinalIgnoreCase))
             {
                 return Task.FromResult(Response(HttpStatusCode.OK,
-                    """{"count":3,"value":[{"id":19,"fileName":"diagnostics.log","url":"https://dev.azure.com/org/attachment/19","size":22,"createdDate":"2026-10-11T10:00:00Z"},{"id":20,"fileName":"screenshot.png","url":"https://dev.azure.com/org/attachment/20","size":68,"createdDate":"2026-10-11T10:00:01Z"},{"id":21,"fileName":"page-source.html","url":"https://dev.azure.com/org/attachment/21","size":300,"createdDate":"2026-10-11T10:00:02Z"}]}"""));
+                    """{"count":4,"value":[{"id":19,"fileName":"diagnostics.log","url":"https://dev.azure.com/org/attachment/19","size":22,"createdDate":"2026-10-11T10:00:00Z"},{"id":20,"fileName":"screenshot.png","url":"https://dev.azure.com/org/attachment/20","size":68,"createdDate":"2026-10-11T10:00:01Z"},{"id":21,"fileName":"page-source.html","url":"https://dev.azure.com/org/attachment/21","size":300,"createdDate":"2026-10-11T10:00:02Z"},{"id":22,"fileName":"page-snapshot.mhtml","url":"https://dev.azure.com/org/attachment/22","size":900,"createdDate":"2026-10-11T10:00:03Z"}]}"""));
             }
 
             if (path.EndsWith("/test/Runs/9/Results/7/attachments/19", StringComparison.OrdinalIgnoreCase))
@@ -1222,6 +1332,14 @@ public sealed class InvestigationTests
             if (path.EndsWith("/test/Runs/9/Results/7/attachments/21", StringComparison.OrdinalIgnoreCase))
             {
                 return Task.FromResult(Response(HttpStatusCode.OK, PageSource, "text/html"));
+            }
+
+            if (path.EndsWith("/test/Runs/9/Results/7/attachments/22", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes(MhtmlPageSource))
+                });
             }
 
             if (path.Contains("/commits/", StringComparison.Ordinal))

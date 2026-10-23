@@ -22,6 +22,12 @@ public class Program
         WriteIndented = true,
         Converters = { new JsonStringEnumConverter() }
     };
+    private static readonly JsonSerializerOptions BatchJsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        Converters = { new JsonStringEnumConverter() }
+    };
 
     public static async Task<int> Main(string[] args)
     {
@@ -62,6 +68,19 @@ public class Program
                         azure,
                         ParsePositiveInt(args, "--build-id"),
                         azureOptions,
+                        cancellationSource.Token);
+                    return 0;
+
+                case "investigate-latest":
+                    azureOptions.Validate(requireCredentials: true);
+                    var batchOutputPath = ParseOptionalValue(args, "--output")
+                        ?? throw new InvestigationWorkflowException("Provide a JSON output file with --output.");
+                    await InvestigateLatestBuildAsync(
+                        host.Services.GetRequiredService<InvestigationOrchestrator>(),
+                        azure,
+                        azureOptions,
+                        aiOptions,
+                        batchOutputPath,
                         cancellationSource.Token);
                     return 0;
 
@@ -220,6 +239,127 @@ public class Program
             Console.WriteLine($"No failed test results were returned for build {buildId}.");
         }
     }
+
+    private static async Task InvestigateLatestBuildAsync(
+        InvestigationOrchestrator orchestrator,
+        IAzureDevOpsClient azure,
+        AzureDevOpsOptions azureOptions,
+        AiOptions aiOptions,
+        string outputPath,
+        CancellationToken cancellationToken)
+    {
+        if (File.Exists(outputPath))
+        {
+            throw new InvestigationWorkflowException(
+                $"Report file '{outputPath}' already exists; choose a different output path.");
+        }
+
+        var build = await azure.GetLatestBuildAsync(cancellationToken);
+        var failedTests = new List<(TestRun Run, TestCaseResult Result)>();
+        var resultSearchMayBeLimited = false;
+        if (build is not null)
+        {
+            var runs = await azure.GetTestRunsAsync(build, cancellationToken);
+            foreach (var run in runs)
+            {
+                var results = await azure.GetTestResultsAsync(run, azureOptions.MaxTestResults, cancellationToken);
+                resultSearchMayBeLimited |= results.Count == azureOptions.MaxTestResults;
+                failedTests.AddRange(results
+                    .Where(result => string.Equals(result.Outcome, "Failed", StringComparison.OrdinalIgnoreCase))
+                    .Select(result => (run, result)));
+            }
+        }
+
+        Console.WriteLine(build is null
+            ? "No pipeline build was found."
+            : $"Latest build: {build.Id} ({build.Name}); failed test results: {failedTests.Count}.");
+        if (resultSearchMayBeLimited)
+        {
+            Console.WriteLine($"At least one test run reached the configured result limit ({azureOptions.MaxTestResults}); the failure list may be incomplete.");
+        }
+
+        var resultsSummary = new List<BatchTestFinding>(failedTests.Count);
+        var authorized = failedTests.Count == 0;
+        if (failedTests.Count > 0)
+        {
+            aiOptions.Validate(requireCredentials: true);
+            var imageDisclosure = aiOptions.SupportsImages
+                ? " Supported screenshot attachments may be sent as image data."
+                : " Screenshot image pixels are not sent.";
+            Console.WriteLine(
+                $"This sends sanitized failure evidence and test source to {aiOptions.Provider}/{aiOptions.Model} for each failed test.{imageDisclosure}");
+            Console.Write("Authorize these model requests?: (y) ");
+            var authorization = Console.IsInputRedirected
+                ? Console.ReadLine()?.Trim()
+                : Console.ReadKey().KeyChar.ToString();
+            authorized = string.Equals(authorization, "y", StringComparison.OrdinalIgnoreCase);
+        }
+
+        foreach (var (run, test) in failedTests)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!authorized)
+            {
+                resultsSummary.Add(new BatchTestFinding(
+                    run.Id, test.Id, test.TestCaseTitle, test.AutomatedTestName, test.Url,
+                    "NotInvestigated", "Model requests were not authorized.", null));
+                continue;
+            }
+
+            Console.WriteLine($"Evaluating failed test {test.Id} in test run {run.Id}...");
+            try
+            {
+                var investigation = await orchestrator.InvestigateAsync(
+                    new InvestigationRequest(build!.Id, test.Id, run.Id), cancellationToken);
+                resultsSummary.Add(new BatchTestFinding(
+                    run.Id, test.Id, test.TestCaseTitle, test.AutomatedTestName, test.Url,
+                    investigation.Status.ToString(), null, investigation));
+            }
+            catch (Exception exception) when (exception is
+                AzureDevOpsException
+                or LlmProviderException
+                or InvestigationOutputException
+                or InvestigationWorkflowException
+                or SourceRepositoryException
+                or IOException
+                or UnauthorizedAccessException)
+            {
+                resultsSummary.Add(new BatchTestFinding(
+                    run.Id, test.Id, test.TestCaseTitle, test.AutomatedTestName, test.Url,
+                    "Failed", exception.Message, null));
+                Console.Error.WriteLine($"Could not investigate test result {test.Id}: {exception.Message}");
+            }
+        }
+
+        var summary = new LatestBuildInvestigationSummary(
+            DateTimeOffset.UtcNow,
+            build,
+            failedTests.Count,
+            resultsSummary.Count(result => result.Investigation is not null),
+            resultSearchMayBeLimited,
+            resultsSummary);
+        var json = JsonSerializer.Serialize(summary, BatchJsonOptions);
+        var fullPath = await InvestigationReportWriter.WriteNewAsync(outputPath, json, cancellationToken);
+        Console.WriteLine($"JSON summary saved: {fullPath}");
+    }
+
+    private sealed record LatestBuildInvestigationSummary(
+        DateTimeOffset GeneratedAtUtc,
+        PipelineRun? Build,
+        int FailedTestCount,
+        int EvaluatedTestCount,
+        bool TestResultsMayBeTruncated,
+        IReadOnlyList<BatchTestFinding> Tests);
+
+    private sealed record BatchTestFinding(
+        int TestRunId,
+        int TestResultId,
+        string TestCaseTitle,
+        string AutomatedTestName,
+        string TestResultUrl,
+        string Status,
+        string? Error,
+        InvestigationResult? Investigation);
 
     private static void PrintResult(InvestigationResult result)
     {
@@ -394,6 +534,9 @@ public class Program
               investigate --build-id <id> --test-result-id <id> [--test-run-id <id>] [--output <file>]
                   Investigate one failed test. Diagnosis is withheld unless its test source is
                   retrieved and verified at the build's exact commit.
+              investigate-latest --output <file>
+                  Find the latest build, investigate every failed test result, and write a JSON summary.
+                  Authorize the model requests once before investigations begin.
 
             Configure AzureDevOps:Organization and AzureDevOps:Project in appsettings.json or
             environment variables. Store AzureDevOps:PersonalAccessToken and AI:ApiKey using

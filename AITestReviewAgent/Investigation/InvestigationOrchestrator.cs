@@ -30,7 +30,8 @@ public sealed class InvestigationOrchestrator(
     };
     private static readonly HashSet<string> TextAttachmentExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".txt", ".log", ".trx", ".xml", ".json", ".csv", ".md", ".out", ".err", ".html", ".htm"
+        ".txt", ".log", ".trx", ".xml", ".json", ".csv", ".md", ".out", ".err",
+        ".html", ".htm", ".mhtml", ".mht"
     };
 
     public async Task<InvestigationResult> InvestigateAsync(
@@ -262,16 +263,26 @@ public sealed class InvestigationOrchestrator(
 
                 var wasTruncated = bytes.Length > maxBytes
                     || attachment.Size is long declaredSize && declaredSize > maxBytes;
-                var text = Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, maxBytes));
-                if (isPageSource)
+                var pageSource = IsPageSource(attachment.Name);
+                var isMhtml = IsMhtml(attachment.Name);
+                var pageSourceTruncated = false;
+                string text;
+                if (pageSource)
                 {
-                    var normalized = PageSourceNormalizer.Normalize(
-                        text, MaxPageSourceCharacters, out var normalizationTruncated);
-                    var item = normalizer.ForAttachment(attachment, normalized) with
+                    text = isMhtml
+                        ? PageSourceNormalizer.NormalizeMhtml(
+                            bytes.AsSpan(0, Math.Min(bytes.Length, maxBytes)).ToArray(),
+                            MaxPageSourceCharacters,
+                            out pageSourceTruncated)
+                        : PageSourceNormalizer.Normalize(
+                            Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, maxBytes)),
+                            MaxPageSourceCharacters,
+                            out pageSourceTruncated);
+                    var item = normalizer.ForAttachment(attachment, text) with
                     {
-                        Source = "Azure DevOps HTML page source attachment"
+                        Source = "Azure DevOps page source attachment"
                     };
-                    evidence.Add(wasTruncated || normalizationTruncated
+                    evidence.Add(wasTruncated || pageSourceTruncated
                         ? item with
                         {
                             Status = EvidenceCollectionStatus.Truncated
@@ -280,6 +291,7 @@ public sealed class InvestigationOrchestrator(
                 }
                 else
                 {
+                    text = Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, maxBytes));
                     var item = normalizer.ForAttachment(attachment, text);
                     evidence.Add(wasTruncated
                         ? item with
@@ -293,6 +305,13 @@ public sealed class InvestigationOrchestrator(
             catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
             {
                 var message = $"Page source attachment '{attachment.Name}' could not be normalized within the processing limit.";
+                errors.Add(message);
+                evidence.Add(normalizer.ForAttachment(attachment, null, message));
+            }
+            catch (InvalidDataException exception)
+            {
+                var message = EvidenceSanitizer.Sanitize(
+                    $"Page source attachment '{attachment.Name}' could not be parsed: {exception.Message}");
                 errors.Add(message);
                 evidence.Add(normalizer.ForAttachment(attachment, null, message));
             }
@@ -310,7 +329,12 @@ public sealed class InvestigationOrchestrator(
 
     private static bool IsPageSource(string name) =>
         Path.GetExtension(name).Equals(".html", StringComparison.OrdinalIgnoreCase)
-        || Path.GetExtension(name).Equals(".htm", StringComparison.OrdinalIgnoreCase);
+        || Path.GetExtension(name).Equals(".htm", StringComparison.OrdinalIgnoreCase)
+        || IsMhtml(name);
+
+    private static bool IsMhtml(string name) =>
+        Path.GetExtension(name).Equals(".mhtml", StringComparison.OrdinalIgnoreCase)
+        || Path.GetExtension(name).Equals(".mht", StringComparison.OrdinalIgnoreCase);
 
     private static bool HasExpectedImageSignature(byte[] bytes, string mediaType) => mediaType switch
     {

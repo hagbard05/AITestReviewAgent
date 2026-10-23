@@ -4,6 +4,8 @@ public interface IAzureDevOpsClient
 {
     Task<IReadOnlyList<PipelineRun>> GetRecentFailedBuildsAsync(int top, CancellationToken cancellationToken);
 
+    Task<PipelineRun?> GetLatestBuildAsync(CancellationToken cancellationToken);
+
     Task<PipelineRun> GetBuildAsync(int buildId, CancellationToken cancellationToken);
 
     Task<IReadOnlyList<TestRun>> GetTestRunsAsync(PipelineRun build, CancellationToken cancellationToken);

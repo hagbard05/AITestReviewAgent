@@ -38,6 +38,13 @@ public sealed class AzureDevOpsClient : IAzureDevOpsClient
         return builds.Select(MapBuild).ToArray();
     }
 
+    public async Task<PipelineRun?> GetLatestBuildAsync(CancellationToken cancellationToken)
+    {
+        var builds = await GetCollectionAsync<BuildDto>(
+            ApiUri("build/builds?queryOrder=finishTimeDescending&$top=1"), cancellationToken);
+        return builds.Count == 0 ? null : MapBuild(builds[0]);
+    }
+
     public async Task<PipelineRun> GetBuildAsync(int buildId, CancellationToken cancellationToken)
     {
         var dto = await GetObjectAsync<BuildDto>(ApiUri($"build/builds/{buildId}"), cancellationToken);
